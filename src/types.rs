@@ -3,10 +3,6 @@ use std::collections::HashMap;
 pub type Value = i64;
 pub type ClacStack = Vec<Value>;
 
-// pub enum ClacBinOp {
-//     ArithOp(fn(ClacValue, ClacValue) -> ClacValue),
-// }
-
 #[derive(Debug, Clone)]
 pub enum Token {
     // data
@@ -44,9 +40,10 @@ pub enum Function {
 }
 
 pub type FuncMap = HashMap<String, Function>;
+pub type CallStack<'a> = Vec<&'a [Token]>;
 
 #[derive(Debug)]
 pub struct ClacState {
     pub stack: ClacStack,
-    pub functions: FuncMap,
+    pub funcmap: FuncMap,
 }

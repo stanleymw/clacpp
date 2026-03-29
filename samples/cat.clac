@@ -1,0 +1,127 @@
+: comment Compiled using Eoghan's flap to clac compiler https://github.com/Eoghanmc22/flap-compiler ;
+
+: comment flap source code:
+    const int PROT_EXEC = 4;
+    const int PROT_READ = 1;
+    const int PROT_WRITE = 2;
+    const int PROT_NONE = 0;
+    
+    const int MAP_PRIVATE = 2;
+    const int MAP_ANON = 32;
+    
+    const int STDIN = 0;
+    const int STDOUT = 1;
+    const int STDERR = 2;
+    
+    const int NULL = 0;
+    
+    int mmap(int addr, int length, int prot, int flags, int fd, int pgoffset) {
+      syscall(0x09, addr, length, prot, flags, fd, pgoffset)
+    }
+    
+    int read(int fd, int buf, int count) { syscall(0, fd, buf, count, 0, 0, 0) }
+    
+    int write(int fd, int buf, int count) { syscall(1, fd, buf, count, 0, 0, 0) }
+    
+    int open(int name, int flags, int mode) {
+      syscall(2, name, flags, mode, 0, 0, 0)
+    }
+    
+    int close(int fd) { syscall(3, fd, 0, 0, 0, 0, 0) }
+    
+    int read_all(int fd, int buf, int count) {
+      int new = read(fd, buf, count);
+    
+      if (new != 0) {
+        new + read_all(fd, buf + new, count - new)
+      } else {
+        0
+      }
+    }
+    
+    int write_all(int fd, int buf, int count) {
+      int new = write(fd, buf, count);
+    
+      if (new != 0) {
+        new + write_all(fd, buf + new, count - new)
+      } else {
+        0
+      }
+    }
+    
+    void copy_all(int buf, int buf_len, int src_fd, int dst_fd) {
+      int in = read_all(src_fd, buf, buf_len);
+    
+      if (in > 0) {
+        write_all(dst_fd, buf, in);
+        copy_all(buf, buf_len, src_fd, dst_fd);
+      }
+    }
+    
+    int get_last_arg(int buf, int last_ptr, int len) {
+      if (len == 0) {
+        last_ptr
+      } else if (read8(buf) == 0) {
+        get_last_arg(buf + 1, buf + 1, len - 1)
+      } else {
+        get_last_arg(buf + 1, last_ptr, len - 1)
+      }
+    }
+    
+    int len = 4096;
+    int page =
+        mmap(NULL, len, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANON, -1, 0);
+    
+    // Put /proc/self/cmdline into page
+    write8(page + 0, '/');
+    write8(page + 1, 'p');
+    write8(page + 2, 'r');
+    write8(page + 3, 'o');
+    write8(page + 4, 'c');
+    write8(page + 5, '/');
+    write8(page + 6, 's');
+    write8(page + 7, 'e');
+    write8(page + 8, 'l');
+    write8(page + 9, 'f');
+    write8(page + 10, '/');
+    write8(page + 11, 'c');
+    write8(page + 12, 'm');
+    write8(page + 13, 'd');
+    write8(page + 14, 'l');
+    write8(page + 15, 'i');
+    write8(page + 16, 'n');
+    write8(page + 17, 'e');
+    write8(page + 18, 0);
+    
+    int cmdline_fd = open(page, 0, 0);
+    int cmdline_len = read_all(cmdline_fd, page, len);
+    int arg = get_last_arg(page, page, cmdline_len - 1);
+    
+    int file_fd = open(arg, 0, 0);
+    copy_all(page, len, file_fd, STDOUT);
+;
+
+: comment Start Definitions ;
+: func-mmap-0 9 7 pick 7 pick 7 pick 7 pick 7 pick 7 pick 13 6 drop_range syscall ;
+: func-read-7 0 4 pick 4 pick 4 pick 0 0 0 10 3 drop_range syscall ;
+: func-write-11 1 4 pick 4 pick 4 pick 0 0 0 10 3 drop_range syscall ;
+: func-open-15 2 4 pick 4 pick 4 pick 0 0 0 10 3 drop_range syscall ;
+: func-close-19 3 2 pick 0 0 0 0 0 8 1 drop_range syscall ;
+: func-on_true-27 4 pick 2 pick + 4 pick 3 pick - 4 pick 3 pick 3 pick func-read_all-21 4 pick 2 pick + 1 pick 9 8 drop_range ;
+: func-on_false-36 0 5 4 drop_range ;
+: func-read_all-21 3 pick 3 pick 3 pick func-read-7 1 pick 0 - if 1 1 skip 0 4 pick 4 pick 7 pick 5 pick 5 pick 10 5 drop_range if func-on_true-27 1 skip func-on_false-36 ;
+: func-on_true-47 4 pick 2 pick + 4 pick 3 pick - 4 pick 3 pick 3 pick func-write_all-41 4 pick 2 pick + 1 pick 9 8 drop_range ;
+: func-on_false-56 0 5 4 drop_range ;
+: func-write_all-41 3 pick 3 pick 3 pick func-write-11 1 pick 0 - if 1 1 skip 0 4 pick 4 pick 7 pick 5 pick 5 pick 10 5 drop_range if func-on_true-47 1 skip func-on_false-56 ;
+: func-on_true-68 3 pick 6 pick 4 pick func-write_all-41 6 pick 6 pick 4 pick 7 pick func-copy_all-61 6 6 drop_range ;
+: func-copy_all-61 2 pick 5 pick 5 pick func-read_all-21 0 2 pick < 6 pick 6 pick 5 pick 5 pick 8 pick 6 pick 12 6 drop_range if func-on_true-68 5 skip drop drop drop drop drop ;
+: func-on_true-82 2 pick 4 3 drop_range ;
+: func-on_true-92 3 pick 1 + 4 pick 1 + 3 pick 1 - 3 pick 3 pick 3 pick 9 6 drop_range func-get_last_arg-77 ;
+: func-on_false-99 3 pick 1 + 2 pick 1 - 2 pick 5 pick 3 pick 8 5 drop_range func-get_last_arg-77 ;
+: func-on_false-86 3 pick read8 1 pick 0 - if 0 1 skip 1 5 pick 5 pick 5 pick 4 pick 9 5 drop_range if func-on_true-92 1 skip func-on_false-99 ;
+: func-get_last_arg-77 1 pick 0 - if 0 1 skip 1 4 pick 4 pick 4 pick 4 pick 8 4 drop_range if func-on_true-82 1 skip func-on_false-86 ;
+
+: comment Start Main ;
+0 4096 3 34 -1 0 func-mmap-0 1 pick 0 + 1 pick 47 write8 2 pick 1 + 1 pick 112 write8 3 pick 2 + 1 pick 114 write8 4 pick 3 + 1 pick 111 write8 5 pick 4 + 1 pick 99 write8 6 pick 5 + 1 pick 47 write8 7 pick 6 + 1 pick 115 write8 8 pick 7 + 1 pick 101 write8 9 pick 8 + 1 pick 108 write8 10 pick 9 + 1 pick 102 write8 11 pick 10 + 1 pick 47 write8 12 pick 11 + 1 pick 99 write8 13 pick 12 + 1 pick 109 write8 14 pick 13 + 1 pick 100 write8 15 pick 14 + 1 pick 108 write8 16 pick 15 + 1 pick 105 write8 17 pick 16 + 1 pick 110 write8 18 pick 17 + 1 pick 101 write8 19 pick 18 + 1 pick 0 write8 20 pick 0 0 func-open-15 1 pick 22 pick 4096 func-read_all-21 1 pick 1 - 23 pick 24 pick 3 pick func-get_last_arg-77 1 pick 0 0 func-open-15 25 pick 4096 3 pick 1 func-copy_all-61
+
+quit

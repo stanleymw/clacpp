@@ -37,7 +37,7 @@ pub type Code = Vec<Token>;
 pub enum Function {
     Clac(Code),
 
-    Native(fn(&mut ClacStack) -> Value),
+    Native(fn(&mut ClacStack)),
 
     ClacOp(fn(Value, Value) -> Value),
 }

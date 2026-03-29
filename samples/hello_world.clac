@@ -1,0 +1,7 @@
+: func-mmap-13 1 pick 3 pick 5 pick 7 pick 9 pick 11 pick 9 syscall swap drop swap drop swap drop swap drop swap drop swap drop ;
+: func-write-21 0 0 0 4 pick 6 pick 8 pick 1 syscall swap drop swap drop swap drop ;
+
+: comment Start Main ;
+0 20 3 34 -1 0 func-mmap-13 104 2 pick write8 1 pick 1 + 101 2 pick write8 2 pick 2 + 108 2 pick write8 3 pick 3 + 108 2 pick write8 4 pick 4 + 111 2 pick write8 5 pick 5 + 32 2 pick write8 6 pick 6 + 119 2 pick write8 7 pick 7 + 111 2 pick write8 8 pick 8 + 114 2 pick write8 9 pick 9 + 108 2 pick write8 10 pick 10 + 100 2 pick write8 11 pick 11 + 33 2 pick write8 12 pick 12 + 10 2 pick write8 1 14 pick 13 func-write-21
+
+quit

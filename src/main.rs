@@ -1,10 +1,15 @@
 mod types;
 use std::{
     collections::HashMap,
+    ffi::c_long,
     io::{self, Read, Write},
 };
 
 use types::*;
+
+unsafe extern "C" {
+    fn syscall(num: c_long, ...) -> c_long;
+}
 
 fn parse(token: &str) -> Token {
     use Token::*;
@@ -49,8 +54,7 @@ fn execute<'cs>(
                 Ok(ExecRes::RecursiveCall(f))
             }
             Some(types::Function::Native(f)) => {
-                let res = f(stack);
-                stack.push(res);
+                f(stack);
 
                 Ok(ExecRes::Executed)
             }
@@ -196,8 +200,8 @@ fn execute_line_toplevel<'token_line>(
                     }
                 }
             }
-            tok => match &mut cur_func {
-                Some((_, f)) => {
+            tok => match cur_func {
+                Some((_, ref mut f)) => {
                     f.push(tok.clone());
                 }
                 None => match execute(funcs, stack, tok)? {
@@ -234,7 +238,7 @@ fn repl(state: &mut ClacState) -> Result<(), ExecError> {
     println!("clac++ by stanleymw");
 
     loop {
-        print!("clac++ $ ");
+        print!("clac++ > ");
         io::stdout().flush().unwrap();
 
         let mut buf = String::new();
@@ -272,6 +276,67 @@ fn main() -> Result<(), ExecError> {
                     }),
                 ),
                 ("<", ClacOp(|x, y| if x < y { 1 } else { 0 })),
+                (
+                    "read8",
+                    Native(|stack| {
+                        let addr = stack.pop().expect("Stack empty on read8");
+                        let val = (unsafe { *(addr as *const u8) }) as Value;
+                        stack.push(val);
+                    }),
+                ),
+                (
+                    "readNative",
+                    Native(|stack| {
+                        let addr = stack.pop().expect("Stack empty on readNative");
+                        let val = (unsafe { *(addr as *const Value) }) as Value;
+                        stack.push(val);
+                    }),
+                ),
+                (
+                    "write8",
+                    Native(|stack| {
+                        let addr = stack.pop().expect("Stack empty on write");
+                        let value: u8 = stack
+                            .pop()
+                            .expect("Stack empty on write")
+                            .try_into()
+                            .expect("trying to write8 on a value that doesn't fit in a byte");
+                        let ptr = addr as *mut u8;
+                        unsafe {
+                            *ptr = value;
+                        }
+                    }),
+                ),
+                (
+                    "writeNative",
+                    Native(|stack| {
+                        let addr = stack.pop().expect("Stack empty on write");
+                        let value: Value = stack.pop().expect("Stack empty on write");
+                        let ptr = addr as *mut Value;
+                        unsafe {
+                            *ptr = value;
+                        }
+                    }),
+                ),
+                (
+                    "syscall",
+                    Native(|stack| {
+                        let res = unsafe {
+                            match stack[..] {
+                                [.., v6, v5, v4, v3, v2, v1, rax] => {
+                                    syscall(rax, v1, v2, v3, v4, v5, v6)
+                                }
+                                _ => panic!("syscall: Expected 6 arguments"),
+                            }
+                        };
+
+                        for _ in 0..7 {
+                            stack.pop();
+                        }
+
+                        stack.push(res);
+                    }),
+                ),
             ]
             .into_iter()
             .map(|(name, x)| (name.to_string(), x)),

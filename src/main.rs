@@ -361,6 +361,10 @@ fn main() -> Result<(), ExecError> {
                         stack.drain(start..(start + amount));
                     }),
                 ),
+                (
+                    "width_native",
+                    Native(|stack| stack.push(std::mem::size_of::<Value>() as Value)),
+                ),
             ]
             .into_iter()
             .map(|(name, x)| (name.to_string(), x)),

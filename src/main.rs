@@ -163,66 +163,43 @@ fn execute_line_nontop<'cs>(
     Ok(LineRes::Executed)
 }
 
-fn execute_line_toplevel<'token_line>(
+fn execute_line_toplevel(
     funcs: &mut FuncMap,
     stack: &mut ClacStack,
-    line: &[Token],
+    mut line: &[Token],
 ) -> Result<LineRes, ExecError> {
     let mut cur_func: Option<(&String, Code)> = None;
-    let mut it = line.iter();
+    // let mut it = line.iter();
 
-    while let Some(token) = it.next() {
-        match token {
-            Token::Colon => {
-                if let Some(_) = cur_func {
-                    return Err(ExecError::BadFunctionDefinition);
-                }
-
-                let Token::Function(name) = it.next().ok_or(ExecError::BadFunctionDefinition)?
-                else {
-                    return Err(ExecError::BadFunctionDefinition);
-                };
-
-                cur_func = Some((name, Vec::new()))
+    loop {
+        (line, cur_func) = match (&line[..], cur_func) {
+            ([Token::Colon, Token::Function(name), rem @ ..], None) => {
+                (rem, Some((name, Vec::new())))
             }
-            Token::Semicolon => {
-                match cur_func {
-                    Some((name, f)) => {
-                        funcs.insert(name.to_string(), Function::Clac(f));
-                        cur_func = None;
-                    }
-                    None => {
-                        // semicolon without starting definition
-                        return Err(ExecError::BadFunctionDefinition);
-                    }
-                }
+            ([Token::Semicolon, rem @ ..], Some((name, f))) => {
+                funcs.insert(name.to_string(), Function::Clac(f));
+                (rem, None)
             }
-            tok => match cur_func {
-                Some((_, ref mut f)) => {
-                    f.push(tok.clone());
-                }
-                None => match execute(funcs, stack, tok)? {
-                    ExecRes::Executed => {}
-                    ExecRes::Skip(n) => {
-                        for _ in 0..n {
-                            it.next().ok_or(ExecError::InvalidSkip)?;
-                        }
-                    }
-                    ExecRes::RecursiveCall(f) => {
-                        execute_line_nontop(funcs, stack, vec![f])?;
-                    }
-
-                    ExecRes::Quit => return Ok(LineRes::Quit),
+            ([tok, rem @ ..], Some((nm, mut f))) => {
+                f.push(tok.clone());
+                (rem, Some((nm, f)))
+            }
+            ([tok, rem @ ..], None) => match execute(funcs, stack, tok)? {
+                ExecRes::Executed => (rem, None),
+                ExecRes::Skip(n) => match rem.split_at_checked(n) {
+                    Some((_, rem2)) => (rem2, None),
+                    None => return Err(ExecError::InvalidSkip),
                 },
+                ExecRes::RecursiveCall(f) => {
+                    execute_line_nontop(funcs, stack, vec![f])?;
+                    (rem, None)
+                }
+                ExecRes::Quit => return Ok(LineRes::Quit),
             },
-        }
+            ([], Some(_)) => return Err(ExecError::BadFunctionDefinition),
+            ([], None) => return Ok(LineRes::Executed),
+        };
     }
-
-    if let Some(_) = cur_func {
-        return Err(ExecError::BadFunctionDefinition);
-    }
-
-    Ok(LineRes::Executed)
 }
 
 fn exec_str(buf: &str, state: &mut ClacState) -> Result<LineRes, ExecError> {

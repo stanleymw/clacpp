@@ -31,12 +31,15 @@ pub enum Token {
     Semicolon,
 }
 
-type Code = Vec<Token>;
+pub type Code = Vec<Token>;
 
 #[derive(Debug)]
 pub enum Function {
     Clac(Code),
-    Native2(fn(Value, Value) -> Value),
+
+    Native(fn(&mut ClacStack) -> Value),
+
+    ClacOp(fn(Value, Value) -> Value),
 }
 
 pub type FuncMap = HashMap<String, Function>;
@@ -46,4 +49,26 @@ pub type CallStack<'a> = Vec<&'a [Token]>;
 pub struct ClacState {
     pub stack: ClacStack,
     pub funcmap: FuncMap,
+}
+
+pub enum ExecRes<'a> {
+    Executed,
+    Skip(usize),
+    RecursiveCall(&'a [Token]),
+    Quit,
+}
+
+pub enum LineRes {
+    Executed,
+    Quit,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum ExecError {
+    UnknownFunction(String),
+    MissingArguments,
+    InvalidSkip,
+    InvalidPick,
+    BadFunctionDefinition,
 }

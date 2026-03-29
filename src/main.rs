@@ -32,28 +32,11 @@ fn parse(token: &str) -> Token {
     }
 }
 
-enum ExecRes<'a> {
-    Executed,
-    Skip(usize),
-    RecursiveCall(&'a [Token]),
-    Quit,
-}
-
-#[derive(Debug)]
-enum ExecError {
-    UnknownFunction(String),
-    MissingArguments,
-    InvalidSkip,
-    InvalidPick,
-    BadFunctionDefinition,
-}
-
 fn execute<'cs>(
     functions: &'cs FuncMap,
     stack: &mut ClacStack,
     token: &Token,
 ) -> Result<ExecRes<'cs>, ExecError> {
-    // println!("{:?}", stack);
     match token {
         &Token::Literal(n) => {
             stack.push(n);
@@ -65,8 +48,13 @@ fn execute<'cs>(
                 // execute_line_no_funcs(functions, stack, f.into_iter())
                 Ok(ExecRes::RecursiveCall(f))
             }
-            // Some(types::Function::Clac(f)) => Ok(ExecRes::Executed),
-            Some(types::Function::Native2(f)) => {
+            Some(types::Function::Native(f)) => {
+                let res = f(stack);
+                stack.push(res);
+
+                Ok(ExecRes::Executed)
+            }
+            Some(types::Function::ClacOp(f)) => {
                 let y = stack.pop().ok_or(ExecError::MissingArguments)?;
                 let x = stack.pop().ok_or(ExecError::MissingArguments)?;
 
@@ -139,8 +127,8 @@ fn execute<'cs>(
 fn execute_line_nontop<'cs>(
     funcs: &'cs FuncMap,
     stack: &mut ClacStack,
-    mut callstack: Vec<&'cs [Token]>,
-) -> Result<ExecRes<'static>, ExecError> {
+    mut callstack: CallStack<'cs>,
+) -> Result<LineRes, ExecError> {
     while let Some(line) = callstack.pop() {
         let Some((token, xs)) = line.split_first() else {
             continue;
@@ -157,10 +145,12 @@ fn execute_line_nontop<'cs>(
                 None => return Err(ExecError::InvalidSkip),
             },
             Ok(ExecRes::Quit) => {
-                return Ok(ExecRes::Quit);
+                return Ok(LineRes::Quit);
             }
             Ok(ExecRes::RecursiveCall(newfunc)) => {
+                // TODO: remove this for tailcall optimization
                 callstack.push(xs);
+
                 callstack.push(newfunc);
             }
             Err(e) => {
@@ -169,15 +159,15 @@ fn execute_line_nontop<'cs>(
         }
     }
 
-    Ok(ExecRes::Executed)
+    Ok(LineRes::Executed)
 }
 
 fn execute_line_toplevel<'token_line>(
     funcs: &mut FuncMap,
     stack: &mut ClacStack,
     line: &[Token],
-) -> Result<ExecRes<'static>, ExecError> {
-    let mut cur_func: Option<(&String, Function)> = None;
+) -> Result<LineRes, ExecError> {
+    let mut cur_func: Option<(&String, Code)> = None;
     let mut it = line.iter();
 
     while let Some(token) = it.next() {
@@ -192,12 +182,12 @@ fn execute_line_toplevel<'token_line>(
                     return Err(ExecError::BadFunctionDefinition);
                 };
 
-                cur_func = Some((name, Function::Clac(Vec::new())))
+                cur_func = Some((name, Vec::new()))
             }
             Token::Semicolon => {
                 match cur_func {
                     Some((name, f)) => {
-                        funcs.insert(name.to_string(), f);
+                        funcs.insert(name.to_string(), Function::Clac(f));
                         cur_func = None;
                     }
                     None => {
@@ -206,11 +196,10 @@ fn execute_line_toplevel<'token_line>(
                     }
                 }
             }
-            tok => match cur_func {
-                Some((_, Function::Clac(ref mut f))) => {
+            tok => match &mut cur_func {
+                Some((_, f)) => {
                     f.push(tok.clone());
                 }
-                Some((_, Function::Native2(_))) => unreachable!(),
                 None => match execute(funcs, stack, tok)? {
                     ExecRes::Executed => {}
                     ExecRes::Skip(n) => {
@@ -221,7 +210,8 @@ fn execute_line_toplevel<'token_line>(
                     ExecRes::RecursiveCall(f) => {
                         execute_line_nontop(funcs, stack, vec![f])?;
                     }
-                    ExecRes::Quit => return Ok(ExecRes::Quit),
+
+                    ExecRes::Quit => return Ok(LineRes::Quit),
                 },
             },
         }
@@ -231,25 +221,13 @@ fn execute_line_toplevel<'token_line>(
         return Err(ExecError::BadFunctionDefinition);
     }
 
-    Ok(ExecRes::Executed)
+    Ok(LineRes::Executed)
 }
 
-fn exec_str(buf: &str, state: &mut ClacState) -> Result<ExecRes<'static>, ExecError> {
+fn exec_str(buf: &str, state: &mut ClacState) -> Result<LineRes, ExecError> {
     let parsed: Vec<Token> = buf.split_whitespace().map(parse).collect();
 
-    match execute_line_toplevel(&mut state.funcmap, &mut state.stack, &parsed) {
-        Ok(ExecRes::Executed) => {
-            return Ok(ExecRes::Executed);
-        }
-        Ok(ExecRes::Quit) => {
-            return Ok(ExecRes::Quit);
-        }
-        Ok(ExecRes::Skip(_)) => unreachable!(),
-        Err(e) => {
-            return Err(e);
-        }
-        _ => unreachable!(),
-    }
+    execute_line_toplevel(&mut state.funcmap, &mut state.stack, &parsed)
 }
 
 fn repl(state: &mut ClacState) -> Result<(), ExecError> {
@@ -262,16 +240,10 @@ fn repl(state: &mut ClacState) -> Result<(), ExecError> {
         let mut buf = String::new();
         io::stdin().read_line(&mut buf).unwrap();
 
-        match exec_str(&buf, state) {
-            Ok(ExecRes::Executed) => {}
-            Ok(ExecRes::Quit) => {
+        match exec_str(&buf, state)? {
+            LineRes::Executed => {}
+            LineRes::Quit => {
                 return Ok(());
-            }
-            Ok(ExecRes::Skip(_)) => unreachable!(),
-            Ok(ExecRes::RecursiveCall(_)) => unreachable!(),
-            Err(e) => {
-                println!("{:?}", e);
-                return Err(e);
             }
         }
 
@@ -287,19 +259,19 @@ fn main() -> Result<(), ExecError> {
         stack: Vec::with_capacity(1_000_000),
         funcmap: HashMap::from_iter(
             [
-                ("+", Native2(Add::add)),
-                ("-", Native2(Sub::sub)),
-                ("*", Native2(Mul::mul)),
-                ("/", Native2(Div::div)),
-                ("%", Native2(Rem::rem)),
+                ("+", ClacOp(Add::add)),
+                ("-", ClacOp(Sub::sub)),
+                ("*", ClacOp(Mul::mul)),
+                ("/", ClacOp(Div::div)),
+                ("%", ClacOp(Rem::rem)),
                 (
                     "**",
-                    Native2(|x, y| match y.try_into() {
+                    ClacOp(|x, y| match y.try_into() {
                         Ok(conv) => Value::pow(x, conv),
                         Err(err) => panic!("Pow error: {}", err),
                     }),
                 ),
-                ("<", Native2(|x, y| if x < y { 1 } else { 0 })),
+                ("<", ClacOp(|x, y| if x < y { 1 } else { 0 })),
             ]
             .into_iter()
             .map(|(name, x)| (name.to_string(), x)),
@@ -313,21 +285,13 @@ fn main() -> Result<(), ExecError> {
         let mut buf: String = String::new();
         let _out = file.read_to_string(&mut buf).expect("Could not read file");
 
-        match exec_str(&buf, &mut state) {
-            Ok(ExecRes::Executed) => {}
-            Ok(ExecRes::Quit) => {
+        match exec_str(&buf, &mut state)? {
+            LineRes::Executed => {}
+            LineRes::Quit => {
                 return Ok(());
-            }
-            Ok(ExecRes::Skip(_)) => unreachable!(),
-            Ok(ExecRes::RecursiveCall(_)) => unreachable!(),
-            Err(e) => {
-                println!("{:?}", e);
-                return Err(e);
             }
         }
     }
-
-    // println!("{:#?}", state);
 
     repl(&mut state)
 }

@@ -134,7 +134,7 @@ fn execute_line_nontop<'cs>(
         let mut optimize_push = |vals: &[Token]| match vals {
             [] => {}
             [Token::Literal(n), Token::Skip, rest @ ..]
-                if (*n >= 1 && ((*n as usize) == rest.len())) => {}
+                if (*n >= 0 && ((*n as usize) == rest.len())) => {}
             _ => {
                 callstack.push(xs);
             }

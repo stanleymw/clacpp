@@ -55,12 +55,6 @@ pub enum ExecRes<'a> {
     Executed,
     Skip(usize),
     RecursiveCall(&'a [Token]),
-    Quit,
-}
-
-pub enum LineRes {
-    Executed,
-    Quit,
 }
 
 #[derive(Debug)]
@@ -71,4 +65,5 @@ pub enum ExecError {
     InvalidSkip,
     InvalidPick,
     BadFunctionDefinition,
+    Quit,
 }

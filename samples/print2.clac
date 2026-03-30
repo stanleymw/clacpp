@@ -1,0 +1,8 @@
+: dup 1 pick ;
+: print2 dup print dup print ;
+
+25 10 * 5 / print2
+
+quit
+
+

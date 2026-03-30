@@ -108,6 +108,6 @@ pub const FUNCTIONS: [(&str, Function); 14] = [
     ),
     (
         "width_native",
-        Native(|stack| stack.push(std::mem::size_of::<Value>() as Value)),
+        Native(|stack| stack.push(Value::BITS.into())),
     ),
 ];

@@ -42,7 +42,7 @@ pub enum Function {
     ClacOp(fn(Value, Value) -> Value),
 }
 
-pub type FuncMap = HashMap<String, Function>;
+pub type FuncMap = ahash::AHashMap<String, Function>;
 pub type CallStack<'a> = Vec<&'a [Token]>;
 
 #[derive(Debug)]
@@ -55,12 +55,6 @@ pub enum ExecRes<'a> {
     Executed,
     Skip(usize),
     RecursiveCall(&'a [Token]),
-    Quit,
-}
-
-pub enum LineRes {
-    Executed,
-    Quit,
 }
 
 #[derive(Debug)]
@@ -71,4 +65,5 @@ pub enum ExecError {
     InvalidSkip,
     InvalidPick,
     BadFunctionDefinition,
+    Quit,
 }

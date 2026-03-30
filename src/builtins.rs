@@ -73,7 +73,7 @@ pub const FUNCTIONS: [(&str, Function); 14] = [
             let res = unsafe {
                 match stack[..] {
                     [.., rax, v1, v2, v3, v4, v5, v6] => syscall(rax, v1, v2, v3, v4, v5, v6),
-                    _ => panic!("syscall: Expected 6 arguments"),
+                    _ => panic!("syscall: Expected 7 arguments"),
                 }
             };
 

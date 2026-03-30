@@ -1,10 +1,7 @@
 mod builtins;
 mod types;
 
-use std::{
-    collections::HashMap,
-    io::{self, Read, Write},
-};
+use std::io::{self, Read, Write};
 
 use types::*;
 
@@ -39,20 +36,16 @@ fn execute<'cs>(
     stack: &mut ClacStack,
     token: &Token,
 ) -> Result<ExecRes<'cs>, ExecError> {
-    match token {
-        &Token::Literal(n) => {
-            stack.push(n);
+    match (stack.as_mut_slice(), token) {
+        (_, Token::Literal(n)) => {
+            stack.push(*n);
             Ok(ExecRes::Executed)
         }
-        Token::Quit => Ok(ExecRes::Quit),
-        Token::Function(name) => match functions.get(name) {
-            Some(types::Function::Clac(f)) => {
-                // execute_line_no_funcs(functions, stack, f.into_iter())
-                Ok(ExecRes::RecursiveCall(f))
-            }
+        (_, Token::Quit) => Err(ExecError::Quit),
+        (_, Token::Function(name)) => match functions.get(name) {
+            Some(types::Function::Clac(f)) => Ok(ExecRes::RecursiveCall(f)),
             Some(types::Function::Native(f)) => {
                 f(stack);
-
                 Ok(ExecRes::Executed)
             }
             Some(types::Function::ClacOp(f)) => {
@@ -64,64 +57,63 @@ fn execute<'cs>(
             }
             None => Err(ExecError::UnknownFunction(name.to_string())),
         },
-        &Token::Print => {
-            let x = stack.pop().ok_or(ExecError::MissingArguments)?;
+        ([.., x], Token::Print) => {
             println!("{x}");
+            stack.pop();
             Ok(ExecRes::Executed)
         }
-        &Token::Drop => {
-            stack.pop().ok_or(ExecError::MissingArguments)?;
+        ([.., _], Token::Drop) => {
+            stack.pop().expect("unreachable");
             Ok(ExecRes::Executed)
         }
-        &Token::Swap => {
-            let y = stack.pop().ok_or(ExecError::MissingArguments)?;
-            let x = stack.pop().ok_or(ExecError::MissingArguments)?;
+        ([.., x, y], Token::Swap) => {
+            std::mem::swap(x, y);
+            Ok(ExecRes::Executed)
+        }
+        ([.., x, y, z], Token::Rot) => {
+            (*x, *y, *z) = (*y, *z, *x);
+            Ok(ExecRes::Executed)
+        }
+        ([.., 0], Token::If) => {
+            stack.pop().unwrap();
 
-            stack.push(y);
-            stack.push(x);
+            Ok(ExecRes::Skip(3))
+        }
+        ([.., _], Token::If) => {
+            stack.pop().unwrap();
 
             Ok(ExecRes::Executed)
         }
-        &Token::Rot => {
-            let z = stack.pop().ok_or(ExecError::MissingArguments)?;
-            let y = stack.pop().ok_or(ExecError::MissingArguments)?;
-            let x = stack.pop().ok_or(ExecError::MissingArguments)?;
-
-            stack.push(y);
-            stack.push(z);
-            stack.push(x);
-
-            Ok(ExecRes::Executed)
-        }
-        &Token::If => {
-            let cond = stack.pop().ok_or(ExecError::MissingArguments)?;
-            if cond == 0 {
-                return Ok(ExecRes::Skip(3));
-            }
-            Ok(ExecRes::Executed)
-        }
-        &Token::Skip => {
-            let amt = stack.pop().ok_or(ExecError::MissingArguments)?;
+        ([.., n], Token::Skip) => {
+            let n = *n;
+            stack.pop();
             Ok(ExecRes::Skip(
-                amt.try_into().map_err(|_| ExecError::InvalidSkip)?,
+                n.try_into().map_err(|_| ExecError::InvalidSkip)?,
             ))
         }
-        &Token::Pick => {
-            let amt = stack.pop().ok_or(ExecError::MissingArguments)?;
-            if !(amt > 0) {
-                return Err(ExecError::InvalidPick);
-            }
-            let amt: usize = amt.try_into().unwrap();
+        ([.., n], Token::Pick) if (*n > 0) => {
+            let conv: usize = (*n).try_into().unwrap();
+            stack.pop();
             let got = stack
-                .get(stack.len() - 1 - (amt - 1))
+                .get::<usize>(stack.len() - conv)
                 .ok_or(ExecError::InvalidPick)?;
 
             stack.push(*got);
 
             Ok(ExecRes::Executed)
         }
-        Token::Semicolon => Err(ExecError::BadFunctionDefinition),
-        Token::Colon => Err(ExecError::BadFunctionDefinition),
+        (
+            _,
+            Token::Swap
+            | Token::Print
+            | Token::Drop
+            | Token::Rot
+            | Token::If
+            | Token::Pick
+            | Token::Skip,
+        ) => Err(ExecError::MissingArguments),
+        (_, Token::Semicolon) => unreachable!(),
+        (_, Token::Colon) => unreachable!(),
     }
 }
 
@@ -129,47 +121,54 @@ fn execute_line_nontop<'cs>(
     funcs: &'cs FuncMap,
     stack: &mut ClacStack,
     mut callstack: CallStack<'cs>,
-) -> Result<LineRes, ExecError> {
+) -> Result<(), ExecError> {
     while let Some(line) = callstack.pop() {
+        // println!("cs = {callstack:?}");
         let Some((token, xs)) = line.split_first() else {
             continue;
         };
 
-        match execute(funcs, stack, token) {
-            Ok(ExecRes::Executed) => {
+        let mut optimize_push = |vals: &[Token]| match vals {
+            [] => {}
+            [Token::Literal(n), Token::Skip, rest @ ..]
+                if (*n >= 0 && ((*n as usize) == rest.len())) => {}
+            _ => {
                 callstack.push(xs);
             }
-            Ok(ExecRes::Skip(n)) => match xs.split_at_checked(n) {
+        };
+
+        match execute(funcs, stack, token)? {
+            ExecRes::Executed => {
+                if !xs.is_empty() {
+                    callstack.push(xs);
+                }
+            }
+            ExecRes::Skip(n) => match xs.split_at_checked(n) {
                 Some((_, remain)) => {
-                    callstack.push(remain);
+                    if !remain.is_empty() {
+                        callstack.push(remain);
+                    }
                 }
                 None => return Err(ExecError::InvalidSkip),
             },
-            Ok(ExecRes::Quit) => {
-                return Ok(LineRes::Quit);
-            }
-            Ok(ExecRes::RecursiveCall(newfunc)) => {
-                // TODO: remove this for tailcall optimization
-                callstack.push(xs);
+            ExecRes::RecursiveCall(newfunc) => {
+                // TODO: tailcall optimization
+                optimize_push(xs);
 
                 callstack.push(newfunc);
-            }
-            Err(e) => {
-                return Err(e);
             }
         }
     }
 
-    Ok(LineRes::Executed)
+    Ok(())
 }
 
 fn execute_line_toplevel(
     funcs: &mut FuncMap,
     stack: &mut ClacStack,
     mut line: &[Token],
-) -> Result<LineRes, ExecError> {
+) -> Result<(), ExecError> {
     let mut cur_func: Option<(&String, Code)> = None;
-    // let mut it = line.iter();
 
     loop {
         (line, cur_func) = match (&line[..], cur_func) {
@@ -179,6 +178,9 @@ fn execute_line_toplevel(
             ([Token::Semicolon, rem @ ..], Some((name, f))) => {
                 funcs.insert(name.to_string(), Function::Clac(f));
                 (rem, None)
+            }
+            ([Token::Colon | Token::Semicolon, ..], _) => {
+                return Err(ExecError::BadFunctionDefinition);
             }
             ([tok, rem @ ..], Some((nm, mut f))) => {
                 f.push(tok.clone());
@@ -194,15 +196,14 @@ fn execute_line_toplevel(
                     execute_line_nontop(funcs, stack, vec![f])?;
                     (rem, None)
                 }
-                ExecRes::Quit => return Ok(LineRes::Quit),
             },
             ([], Some(_)) => return Err(ExecError::BadFunctionDefinition),
-            ([], None) => return Ok(LineRes::Executed),
+            ([], None) => return Ok(()),
         };
     }
 }
 
-fn exec_str(buf: &str, state: &mut ClacState) -> Result<LineRes, ExecError> {
+fn exec_str(buf: &str, state: &mut ClacState) -> Result<(), ExecError> {
     let parsed: Vec<Token> = buf.split_whitespace().map(parse).collect();
 
     execute_line_toplevel(&mut state.funcmap, &mut state.stack, &parsed)
@@ -212,18 +213,17 @@ fn repl(state: &mut ClacState) -> Result<(), ExecError> {
     println!("clac++ by stanleymw");
 
     loop {
-        print!("clac++ > ");
+        print!("clac++> ");
         io::stdout().flush().unwrap();
 
         let mut buf = String::new();
         io::stdin().read_line(&mut buf).unwrap();
 
-        match exec_str(&buf, state)? {
-            LineRes::Executed => {}
-            LineRes::Quit => {
-                return Ok(());
-            }
-        }
+        match exec_str(&buf, state) {
+            Err(ExecError::Quit) => return Ok(()),
+            Err(x) => return Err(x),
+            Ok(()) => {}
+        };
 
         println!("{:?}", state.stack)
     }
@@ -232,7 +232,7 @@ fn repl(state: &mut ClacState) -> Result<(), ExecError> {
 fn main() -> Result<(), ExecError> {
     let mut state: ClacState = ClacState {
         stack: Vec::with_capacity(1_000_000),
-        funcmap: HashMap::from_iter(
+        funcmap: ahash::AHashMap::from_iter(
             builtins::FUNCTIONS
                 .into_iter()
                 .map(|(name, x)| (name.to_string(), x)),
@@ -246,12 +246,11 @@ fn main() -> Result<(), ExecError> {
         let mut buf: String = String::new();
         let _out = file.read_to_string(&mut buf).expect("Could not read file");
 
-        match exec_str(&buf, &mut state)? {
-            LineRes::Executed => {}
-            LineRes::Quit => {
-                return Ok(());
-            }
-        }
+        match exec_str(&buf, &mut state) {
+            Err(ExecError::Quit) => return Ok(()),
+            Err(x) => return Err(x),
+            Ok(()) => {}
+        };
     }
 
     repl(&mut state)

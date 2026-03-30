@@ -1,0 +1,8 @@
+
+: comment Start Definitions ;
+: func-on_true-2 func-lol-0 ;
+: func-on_false-5 func-lol-0 ;
+: func-lol-0 123 print 1 if func-on_true-2 1 skip func-on_false-5 ;
+
+: comment Start Main ;
+func-lol-0

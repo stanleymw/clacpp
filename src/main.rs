@@ -222,7 +222,11 @@ fn repl(state: &mut ClacState) -> Result<(), ExecError> {
         let mut buf = String::new();
         io::stdin().read_line(&mut buf).unwrap();
 
-        exec_str(&buf, state)?;
+        match exec_str(&buf, state) {
+            Err(ExecError::Quit) => return Ok(()),
+            Err(x) => return Err(x),
+            Ok(()) => {}
+        };
 
         println!("{:?}", state.stack)
     }
@@ -245,7 +249,11 @@ fn main() -> Result<(), ExecError> {
         let mut buf: String = String::new();
         let _out = file.read_to_string(&mut buf).expect("Could not read file");
 
-        exec_str(&buf, &mut state)?;
+        match exec_str(&buf, &mut state) {
+            Err(ExecError::Quit) => return Ok(()),
+            Err(x) => return Err(x),
+            Ok(()) => {}
+        };
     }
 
     repl(&mut state)

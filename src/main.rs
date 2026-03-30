@@ -3,6 +3,7 @@ mod types;
 
 use std::io::{self, Read, Write};
 
+use clap::Parser;
 use types::*;
 
 fn parse(token: &str) -> Token {
@@ -46,7 +47,7 @@ fn execute<'cs>(
             let f = match state {
                 FunctionRef::Resolved(x) => &functions.functions[*x],
                 FunctionRef::Unresolved(name) => match functions.map.get(name) {
-                    Some(x) => &functions.functions[*x],
+                    Some(x) => &functions.functions[*x], // NOTE: we SHOULD be executing top level, because otherwise this token should have already been resolved.
                     None => return Err(ExecError::UnknownFunction(name.to_string())),
                 },
             };
@@ -254,8 +255,8 @@ fn exec_str(buf: &str, state: &mut ClacState) -> Result<(), ExecError> {
     execute_line_toplevel(&mut state.funcmap, &mut state.stack, &parsed)
 }
 
-fn repl(state: &mut ClacState) -> Result<(), ExecError> {
-    println!("clac++ by stanleymw");
+fn repl(state: &mut ClacState, hide_stack: bool) -> Result<(), ExecError> {
+    println!("clac++ by stanleymw ({})", env!("VERGEN_GIT_DESCRIBE"),);
 
     loop {
         print!("clac++> ");
@@ -270,7 +271,9 @@ fn repl(state: &mut ClacState) -> Result<(), ExecError> {
             Ok(()) => {}
         };
 
-        println!("{:?}", state.stack)
+        if !hide_stack {
+            println!("{:?}", state.stack)
+        }
     }
 }
 
@@ -285,15 +288,29 @@ fn name_func_pair_to_funcmap<const N: usize>(xs: [(&str, Function); N]) -> FuncM
     }
 }
 
+#[derive(clap::Parser)]
+struct Args {
+    file: Option<std::path::PathBuf>,
+
+    /// The number of elements that will have space pre-allocate for on the Clac Stack
+    #[arg(short, long, default_value_t = 1_000_000)]
+    stack: usize,
+
+    /// Hide the Clac Stack in the Repl
+    #[arg(short = 'x', long)]
+    hide_stack: bool,
+}
+
 fn main() -> Result<(), ExecError> {
+    let args = Args::parse();
+
     let mut state: ClacState = ClacState {
-        stack: Vec::with_capacity(1_000_000),
+        stack: Vec::with_capacity(args.stack),
         funcmap: name_func_pair_to_funcmap(builtins::FUNCTIONS),
     };
 
-    let mut args = std::env::args();
-    if let Some(n) = args.nth(1) {
-        let mut file = std::fs::File::open(n).expect("Could not open file");
+    if let Some(f) = args.file {
+        let mut file = std::fs::File::open(f).expect("Could not open file");
 
         let mut buf: String = String::new();
         let _out = file.read_to_string(&mut buf).expect("Could not read file");
@@ -305,5 +322,5 @@ fn main() -> Result<(), ExecError> {
         };
     }
 
-    repl(&mut state)
+    repl(&mut state, args.hide_stack)
 }

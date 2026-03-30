@@ -42,7 +42,7 @@ pub enum Function {
     ClacOp(fn(Value, Value) -> Value),
 }
 
-pub type FuncMap = HashMap<String, Function>;
+pub type FuncMap = ahash::AHashMap<String, Function>;
 pub type CallStack<'a> = Vec<&'a [Token]>;
 
 #[derive(Debug)]

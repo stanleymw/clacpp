@@ -1,10 +1,7 @@
 mod builtins;
 mod types;
 
-use std::{
-    collections::HashMap,
-    io::{self, Read, Write},
-};
+use std::io::{self, Read, Write};
 
 use types::*;
 
@@ -235,7 +232,7 @@ fn repl(state: &mut ClacState) -> Result<(), ExecError> {
 fn main() -> Result<(), ExecError> {
     let mut state: ClacState = ClacState {
         stack: Vec::with_capacity(1_000_000),
-        funcmap: HashMap::from_iter(
+        funcmap: ahash::AHashMap::from_iter(
             builtins::FUNCTIONS
                 .into_iter()
                 .map(|(name, x)| (name.to_string(), x)),

@@ -26,7 +26,7 @@ fn parse(token: &str) -> Token {
         // "syscall" => Syscall,
         id => match id.parse() {
             Ok(num) => Literal(num),
-            Err(_) => Function(id.to_string()),
+            Err(_) => Function(FunctionRef::Unresolved(id.to_string())),
         },
     }
 }
@@ -42,21 +42,31 @@ fn execute<'cs>(
             Ok(ExecRes::Executed)
         }
         (_, Token::Quit) => Err(ExecError::Quit),
-        (_, Token::Function(name)) => match functions.get(name) {
-            Some(types::Function::Clac(f)) => Ok(ExecRes::RecursiveCall(f)),
-            Some(types::Function::Native(f)) => {
-                f(stack);
-                Ok(ExecRes::Executed)
-            }
-            Some(types::Function::ClacOp(f)) => {
-                let y = stack.pop().ok_or(ExecError::MissingArguments)?;
-                let x = stack.pop().ok_or(ExecError::MissingArguments)?;
+        (_, Token::Function(state)) => {
+            let f = match state {
+                FunctionRef::Resolved(x) => &functions.functions[*x],
+                FunctionRef::Unresolved(name) => match functions.map.get(name) {
+                    Some(x) => &functions.functions[*x],
+                    None => return Err(ExecError::UnknownFunction(name.to_string())),
+                },
+            };
 
-                stack.push(f(x, y));
-                Ok(ExecRes::Executed)
+            match f {
+                Function::Clac(f) => Ok(ExecRes::RecursiveCall(f)),
+                Function::Native(f) => {
+                    f(stack);
+                    Ok(ExecRes::Executed)
+                }
+                Function::ClacOp(f) => {
+                    let y = stack.pop().ok_or(ExecError::MissingArguments)?;
+                    let x = stack.pop().ok_or(ExecError::MissingArguments)?;
+
+                    stack.push(f(x, y));
+                    Ok(ExecRes::Executed)
+                }
             }
-            None => Err(ExecError::UnknownFunction(name.to_string())),
-        },
+        }
+
         ([.., x], Token::Print) => {
             println!("{x}");
             stack.pop();
@@ -163,6 +173,21 @@ fn execute_line_nontop<'cs>(
     Ok(())
 }
 
+// resolve functions so we don't need to do a costly hashmap lookup
+fn resolve_funcmap(funcs: &mut FuncMap) {
+    for function in &mut funcs.functions {
+        if let Function::Clac(f) = function {
+            for token in f {
+                if let Token::Function(FunctionRef::Unresolved(name)) = token {
+                    if let Some(resolved) = funcs.map.get(name) {
+                        *token = Token::Function(FunctionRef::Resolved(*resolved));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn execute_line_toplevel(
     funcs: &mut FuncMap,
     stack: &mut ClacStack,
@@ -172,11 +197,31 @@ fn execute_line_toplevel(
 
     loop {
         (line, cur_func) = match (&line[..], cur_func) {
-            ([Token::Colon, Token::Function(name), rem @ ..], None) => {
-                (rem, Some((name, Vec::new())))
-            }
+            (
+                [
+                    Token::Colon,
+                    Token::Function(FunctionRef::Unresolved(name)),
+                    rem @ ..,
+                ],
+                None,
+            ) => (rem, Some((name, Vec::new()))),
             ([Token::Semicolon, rem @ ..], Some((name, f))) => {
-                funcs.insert(name.to_string(), Function::Clac(f));
+                let len = funcs.functions.len();
+
+                // if we are re-defining a function, we should replace
+                match funcs.map.get(name) {
+                    Some(idx) => {
+                        funcs.functions[*idx] = Function::Clac(f);
+                    }
+                    None => {
+                        funcs.functions.push(Function::Clac(f));
+                        funcs.map.insert(name.to_string(), len);
+                    }
+                };
+
+                // resolve function names to indices
+                resolve_funcmap(funcs);
+
                 (rem, None)
             }
             ([Token::Colon | Token::Semicolon, ..], _) => {
@@ -229,14 +274,21 @@ fn repl(state: &mut ClacState) -> Result<(), ExecError> {
     }
 }
 
+fn name_func_pair_to_funcmap<const N: usize>(xs: [(&str, Function); N]) -> FuncMap {
+    FuncMap {
+        map: ahash::AHashMap::from_iter(
+            xs.iter()
+                .enumerate()
+                .map(|(i, (name, _))| (name.to_string(), i)),
+        ),
+        functions: Vec::from_iter(xs.into_iter().map(|(_, func)| func)),
+    }
+}
+
 fn main() -> Result<(), ExecError> {
     let mut state: ClacState = ClacState {
         stack: Vec::with_capacity(1_000_000),
-        funcmap: ahash::AHashMap::from_iter(
-            builtins::FUNCTIONS
-                .into_iter()
-                .map(|(name, x)| (name.to_string(), x)),
-        ),
+        funcmap: name_func_pair_to_funcmap(builtins::FUNCTIONS),
     };
 
     let mut args = std::env::args();

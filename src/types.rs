@@ -1,13 +1,19 @@
-use std::collections::HashMap;
-
 pub type Value = i64;
 pub type ClacStack = Vec<Value>;
+
+type FunctionIndex = usize;
+
+#[derive(Debug, Clone)]
+pub enum FunctionRef {
+    Resolved(FunctionIndex),
+    Unresolved(String),
+}
 
 #[derive(Debug, Clone)]
 pub enum Token {
     // data
     Literal(Value),
-    Function(String),
+    Function(FunctionRef),
 
     // side effects
     Quit,
@@ -42,8 +48,14 @@ pub enum Function {
     ClacOp(fn(Value, Value) -> Value),
 }
 
-pub type FuncMap = ahash::AHashMap<String, Function>;
+// pub type FuncMap = ahash::AHashMap<String, FunctionIndex>;
 pub type CallStack<'a> = Vec<&'a [Token]>;
+
+#[derive(Debug)]
+pub struct FuncMap {
+    pub map: ahash::AHashMap<String, FunctionIndex>,
+    pub functions: Vec<Function>,
+}
 
 #[derive(Debug)]
 pub struct ClacState {

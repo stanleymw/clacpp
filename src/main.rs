@@ -299,6 +299,9 @@ struct Args {
     /// Hide the Clac Stack in the Repl
     #[arg(short = 'x', long)]
     hide_stack: bool,
+
+    #[arg(trailing_var_arg = true)]
+    _extra: Vec<String>,
 }
 
 fn main() -> Result<(), ExecError> {

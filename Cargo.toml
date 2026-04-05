@@ -1,5 +1,5 @@
 [package]
-name = "clac-rs"
+name = "clac-lang"
 version = "0.1.0"
 edition = "2024"
 exclude = [

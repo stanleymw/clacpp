@@ -8,6 +8,9 @@ exclude = [
 license = "GPL-3.0-or-later"
 description = "Reference implementation of Clac++, a simple stack-based postfix (reverse polish notation) calculator/programming language."
 
+[[bin]]
+name = "clac"
+
 [dependencies]
 ahash = "0.8.12"
 clap = { version = "4.6.0", features = ["derive"] }

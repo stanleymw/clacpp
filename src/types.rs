@@ -13,7 +13,7 @@ pub enum FunctionRef {
 pub enum Token {
     // data
     Literal(Value),
-    Function(FunctionRef),
+    FunctionCall(FunctionRef),
 
     // side effects
     Quit,
@@ -58,6 +58,7 @@ pub struct FuncMap {
 }
 
 #[derive(Debug)]
+/// The primary struct representing the state of the Clac++ machine.
 pub struct ClacState {
     pub stack: ClacStack,
     pub funcmap: FuncMap,

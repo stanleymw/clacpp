@@ -8,10 +8,10 @@ fn resolve_funcmap(funcs: &mut FuncMap) {
     for function in &mut funcs.functions {
         if let Function::Clac(f) = function {
             for token in f {
-                if let Token::Function(FunctionRef::Unresolved(name)) = token
+                if let Token::FunctionCall(FunctionRef::Unresolved(name)) = token
                     && let Some(resolved) = funcs.map.get(name)
                 {
-                    *token = Token::Function(FunctionRef::Resolved(*resolved));
+                    *token = Token::FunctionCall(FunctionRef::Resolved(*resolved));
                 }
             }
         }
@@ -39,7 +39,7 @@ fn parse(token: &str) -> Token {
         // "syscall" => Syscall,
         id => match id.parse() {
             Ok(num) => Literal(num),
-            Err(_) => Function(FunctionRef::Unresolved(id.to_string())),
+            Err(_) => FunctionCall(FunctionRef::Unresolved(id.to_string())),
         },
     }
 }
@@ -56,7 +56,7 @@ impl ClacState {
                 Ok(ExecRes::Executed)
             }
             (_, Token::Quit) => Err(ExecError::Quit),
-            (_, Token::Function(state)) => {
+            (_, Token::FunctionCall(state)) => {
                 let f = match state {
                     FunctionRef::Resolved(x) => &functions.functions[*x],
                     FunctionRef::Unresolved(name) => match functions.map.get(name) {
@@ -200,7 +200,7 @@ impl ClacState {
                 (
                     [
                         Token::Colon,
-                        Token::Function(FunctionRef::Unresolved(name)),
+                        Token::FunctionCall(FunctionRef::Unresolved(name)),
                         rem @ ..,
                     ],
                     None,

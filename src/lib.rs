@@ -1,6 +1,7 @@
 mod builtins;
 pub mod types;
-
+use rustyline::error::ReadlineError;
+use thiserror::Error;
 use types::*;
 
 // resolve functions so we don't need to do a costly hashmap lookup
@@ -272,6 +273,40 @@ impl Default for ClacState {
         ClacState {
             stack: Vec::new(),
             funcmap: name_func_pair_to_funcmap(builtins::FUNCTIONS),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ReplError {
+    #[error("Execution Error: {0}")]
+    ExecError(#[from] ExecError),
+
+    #[error("Readline Error: {0}")]
+    LineError(#[from] ReadlineError),
+}
+
+/// Launch an interactive REPL on the provided ClacState.
+pub fn repl(state: &mut ClacState, hide_stack: bool) -> Result<(), ReplError> {
+    println!("clac++ by stanleymw");
+
+    let mut editor = rustyline::DefaultEditor::new()?;
+
+    loop {
+        let read = match editor.readline("clac++> ") {
+            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => return Ok(()),
+            Err(e) => return Err(e.into()),
+            Ok(res) => res,
+        };
+
+        match state.execute_str(&read) {
+            Err(ExecError::Quit) => return Ok(()),
+            Err(x) => return Err(x.into()),
+            Ok(()) => {}
+        };
+
+        if !hide_stack {
+            println!("{:?}", state.stack)
         }
     }
 }

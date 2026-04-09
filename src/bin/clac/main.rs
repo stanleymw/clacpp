@@ -1,28 +1,6 @@
-use clac_lang::types::*;
+use clac_lang::{ReplError, types::*};
 use clap::Parser;
-use std::io::{self, Read, Write};
-
-fn repl(state: &mut ClacState, hide_stack: bool) -> Result<(), ExecError> {
-    println!("clac++ by stanleymw");
-
-    loop {
-        print!("clac++> ");
-        io::stdout().flush().unwrap();
-
-        let mut buf = String::new();
-        io::stdin().read_line(&mut buf).unwrap();
-
-        match state.execute_str(&buf) {
-            Err(ExecError::Quit) => return Ok(()),
-            Err(x) => return Err(x),
-            Ok(()) => {}
-        };
-
-        if !hide_stack {
-            println!("{:?}", state.stack)
-        }
-    }
-}
+use std::io::Read;
 
 #[derive(clap::Parser)]
 struct Args {
@@ -40,7 +18,7 @@ struct Args {
     _extra: Vec<String>,
 }
 
-fn main() -> Result<(), ExecError> {
+fn main() -> Result<(), ReplError> {
     let args = Args::parse();
 
     let mut state: ClacState = Default::default();
@@ -54,10 +32,10 @@ fn main() -> Result<(), ExecError> {
 
         match state.execute_str(&buf) {
             Err(ExecError::Quit) => return Ok(()),
-            Err(x) => return Err(x),
+            Err(x) => return Err(x.into()),
             Ok(()) => {}
         };
     }
 
-    repl(&mut state, args.hide_stack)
+    clac_lang::repl(&mut state, args.hide_stack)
 }

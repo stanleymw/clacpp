@@ -1,3 +1,5 @@
+use thiserror::Error;
+
 pub type Value = i64;
 pub type ClacStack = Vec<Value>;
 
@@ -70,13 +72,18 @@ pub enum ExecRes<'a> {
     RecursiveCall(&'a [Token]),
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
+#[derive(Debug, Error)]
 pub enum ExecError {
+    #[error("Unknown function {0}")]
     UnknownFunction(String),
+    #[error("Missing arguments. Not enough elements on stack")]
     MissingArguments,
+    #[error("Invalid Skip")]
     InvalidSkip,
+    #[error("Invalid Pick")]
     InvalidPick,
+    #[error("Bad function definition")]
     BadFunctionDefinition,
+    #[error("Quit")]
     Quit,
 }

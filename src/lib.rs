@@ -290,7 +290,7 @@ pub enum ReplError {
 
 /// Launch an interactive REPL on the provided ClacState.
 pub fn repl(state: &mut ClacState, hide_stack: bool) -> Result<(), ReplError> {
-    println!("clac++ by stanleymw");
+    println!("clac++ {} by stanleymw", env!("CARGO_PKG_VERSION"),);
 
     let mut editor = rustyline::DefaultEditor::new()?;
 

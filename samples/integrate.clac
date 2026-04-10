@@ -1,0 +1,18 @@
+: __README This program was compiled by Stanley's cclac (Python -> Clac) compiler (github.com/stanleymw/clac) ;
+: dup 2 pick 2 pick ;
+: prec 1000 ;
+: delta 10 prec ;
+: add 4 pick 4 pick 2 0 - pick rot rot drop drop 3 pick 3 pick 2 0 - pick rot rot drop drop + 5 pick 5 pick 2 1 - pick rot rot drop drop rot drop rot drop rot drop rot drop ;
+: sub 4 pick 4 pick 2 0 - pick rot rot drop drop 3 pick 3 pick 2 0 - pick rot rot drop drop - 5 pick 5 pick 2 1 - pick rot rot drop drop rot drop rot drop rot drop rot drop ;
+: mul 4 pick 4 pick 2 0 - pick rot rot drop drop 3 pick 3 pick 2 0 - pick rot rot drop drop * 5 pick 5 pick 2 1 - pick rot rot drop drop / 5 pick 5 pick 2 1 - pick rot rot drop drop rot drop rot drop rot drop rot drop ;
+: convert 1 pick prec * prec rot drop ;
+: f 2 pick 2 pick 4 pick 4 pick mul 4 pick 4 pick add 1 convert add rot drop rot drop ;
+: update__IF__0 3 pick 3 pick 7 pick 7 pick 13 pick 13 pick update ;
+: update__IF__1 5 pick 5 pick ;
+: update delta 6 pick 6 pick 10 pick 10 pick f 6 pick 6 pick mul add 10 pick 10 pick 6 pick 6 pick add 2 pick 2 pick 10 pick 10 pick sub 2 0 - pick rot rot drop drop 1 pick 0 < if update__IF__0 1 skip update__IF__1 rot drop rot drop rot drop rot drop rot drop rot drop rot drop rot drop rot drop rot drop rot drop rot drop rot drop ;
+: integrate_i 4 pick 4 pick 0 prec 6 pick 6 pick update rot drop rot drop rot drop rot drop ;
+: integrate 4 pick 4 pick 4 pick 4 pick integrate_i 2 pick 2 pick 2 0 - pick rot rot drop drop print 2 pick 2 pick 2 1 - pick rot rot drop drop print drop drop drop drop drop drop ;
+: run -10000 convert 10000 convert integrate ;
+
+run
+quit

@@ -1,6 +1,8 @@
 mod builtins;
 pub mod types;
 
+use std::hint::unreachable_unchecked;
+
 use rustyline::error::ReadlineError;
 use thiserror::Error;
 use types::*;
@@ -118,35 +120,17 @@ impl ClacState {
             Instr::Skip => Ok(ExecRes::Skip(
                 xpop()?.try_into().map_err(|_| ExecError::InvalidSkip)?,
             )),
-            Instr::Add => {
+            it @ (Instr::Add | Instr::Sub | Instr::Mul | Instr::Div | Instr::Rem) => {
                 let b = xpop()?;
                 let a = xpop()?;
-                stack.push(a + b);
-                Ok(ExecRes::Executed)
-            }
-            Instr::Sub => {
-                let b = xpop()?;
-                let a = xpop()?;
-                stack.push(a - b);
-                Ok(ExecRes::Executed)
-            }
-
-            Instr::Mul => {
-                let b = xpop()?;
-                let a = xpop()?;
-                stack.push(a * b);
-                Ok(ExecRes::Executed)
-            }
-            Instr::Div => {
-                let b = xpop()?;
-                let a = xpop()?;
-                stack.push(a / b);
-                Ok(ExecRes::Executed)
-            }
-            Instr::Rem => {
-                let b = xpop()?;
-                let a = xpop()?;
-                stack.push(a % b);
+                stack.push(match it {
+                    Instr::Add => a + b,
+                    Instr::Sub => a - b,
+                    Instr::Mul => a * b,
+                    Instr::Div => a / b,
+                    Instr::Rem => a % b,
+                    _ => unsafe { unreachable_unchecked() }, // TODO: prove,
+                });
                 Ok(ExecRes::Executed)
             }
             Instr::Pick => {

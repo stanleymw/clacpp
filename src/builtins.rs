@@ -1,8 +1,8 @@
-use std::{ffi::c_long, ops::*};
+use std::ffi::c_long;
 
 use crate::types::{
     Function::{self, *},
-    Value,
+    Instr, Value,
 };
 
 unsafe extern "C" {
@@ -10,11 +10,11 @@ unsafe extern "C" {
 }
 
 pub const FUNCTIONS: [(&str, Function); 14] = [
-    ("+", ClacOp(Add::add)),
-    ("-", ClacOp(Sub::sub)),
-    ("*", ClacOp(Mul::mul)),
-    ("/", ClacOp(Div::div)),
-    ("%", ClacOp(Rem::rem)),
+    ("+", ClacInstr(Instr::Add)),
+    ("-", ClacInstr(Instr::Sub)),
+    ("*", ClacInstr(Instr::Mul)),
+    ("/", ClacInstr(Instr::Div)),
+    ("%", ClacInstr(Instr::Rem)),
     (
         "**",
         ClacOp(|x, y| match y.try_into() {

@@ -1,13 +1,8 @@
 mod builtins;
 pub mod types;
-use std::mem::transmute;
 
-use cranelift::prelude::{
-    AbiParam, Configurable, FunctionBuilder, FunctionBuilderContext, InstBuilder, Signature,
-    settings, types::I64,
-};
-use cranelift_jit::JITBuilder;
-use cranelift_module::Module;
+use std::hint::unreachable_unchecked;
+
 use rustyline::error::ReadlineError;
 use thiserror::Error;
 use types::*;
@@ -17,12 +12,10 @@ fn resolve_funcmap(funcs: &mut FuncMap) {
     for function in &mut funcs.functions {
         if let Function::Clac(f) = function {
             for token in f {
-                if let Token::FunctionCall(FunctionRef(InternalFunctionRef::Unresolved(name))) =
-                    token
+                if let Instr::FunctionCall(FuncRef::Unresolved(name)) = token
                     && let Some(resolved) = funcs.map.get(name)
                 {
-                    *token =
-                        Token::FunctionCall(FunctionRef(InternalFunctionRef::Resolved(*resolved)));
+                    *token = Instr::FunctionCall(FuncRef::Resolved(*resolved));
                 }
             }
         }
@@ -50,7 +43,7 @@ fn parse(token: &str) -> Token {
         // "syscall" => Syscall,
         id => match id.parse() {
             Ok(num) => Literal(num),
-            Err(_) => FunctionCall(FunctionRef::new(id.to_string())),
+            Err(_) => FunctionCall(id.to_string()),
         },
     }
 }
@@ -58,20 +51,22 @@ fn parse(token: &str) -> Token {
 impl ClacState {
     fn execute<'cs>(
         functions: &'cs FuncMap,
-        stack: &mut ClacStack,
-        token: &Token,
+        stack: &mut ValueStack,
+        token: &Instr,
     ) -> Result<ExecRes<'cs>, ExecError> {
-        match (stack.as_mut_slice(), token) {
-            (_, Token::Literal(n)) => {
+        let mut xpop = || stack.pop().ok_or(ExecError::MissingArguments);
+
+        match token {
+            Instr::Literal(n) => {
                 stack.push(*n);
                 Ok(ExecRes::Executed)
             }
-            (_, Token::Quit) => Err(ExecError::Quit),
-            (_, Token::FunctionCall(FunctionRef(state))) => {
+            Instr::Quit => Err(ExecError::Quit),
+            Instr::FunctionCall(state) => {
                 let f = match state {
-                    InternalFunctionRef::Resolved(x) => &functions.functions[*x],
-                    InternalFunctionRef::Unresolved(name) => match functions.map.get(name) {
-                        Some(x) => &functions.functions[*x], // NOTE: we SHOULD be executing top level, because otherwise this token should have already been resolved.
+                    FuncRef::Resolved(x) => &functions.functions[*x],
+                    FuncRef::Unresolved(name) => match functions.map.get(name) {
+                        Some(_) => unreachable!("Should have already been resolved"), // NOTE: we SHOULD be executing top level, because otherwise this token should have already been resolved.
                         None => return Err(ExecError::UnknownFunction(name.to_string())),
                     },
                 };
@@ -83,52 +78,63 @@ impl ClacState {
                         Ok(ExecRes::Executed)
                     }
                     Function::ClacOp(f) => {
-                        let y = stack.pop().ok_or(ExecError::MissingArguments)?;
-                        let x = stack.pop().ok_or(ExecError::MissingArguments)?;
+                        let y = xpop()?;
+                        let x = xpop()?;
 
                         stack.push(f(x, y));
                         Ok(ExecRes::Executed)
                     }
+                    Function::ClacInstr(_) => unreachable!(
+                        "Tried to execute a ClacInstr as a function call, which should be impossible if this instruction was obtained from a token by token_to_instruction"
+                    ),
                 }
             }
 
-            ([.., x], Token::Print) => {
-                println!("{x}");
-                stack.pop();
+            Instr::Print => {
+                println!("{}", xpop()?);
                 Ok(ExecRes::Executed)
             }
-            ([.., _], Token::Drop) => {
-                stack.pop().expect("unreachable");
+            Instr::Drop => {
+                xpop()?;
                 Ok(ExecRes::Executed)
             }
-            ([.., x, y], Token::Swap) => {
-                std::mem::swap(x, y);
+            Instr::Swap => {
+                let [.., a, b] = stack.as_mut_slice() else {
+                    return Err(ExecError::MissingArguments);
+                };
+
+                std::mem::swap(a, b);
                 Ok(ExecRes::Executed)
             }
-            ([.., x, y, z], Token::Rot) => {
+            Instr::Rot => {
+                let [.., x, y, z] = stack.as_mut_slice() else {
+                    return Err(ExecError::MissingArguments);
+                };
                 (*x, *y, *z) = (*y, *z, *x);
                 Ok(ExecRes::Executed)
             }
-            ([.., 0], Token::If) => {
-                stack.pop().unwrap();
-
-                Ok(ExecRes::Skip(3))
-            }
-            ([.., _], Token::If) => {
-                stack.pop().unwrap();
-
+            Instr::If => match xpop()? {
+                0 => Ok(ExecRes::Skip(3)),
+                _ => Ok(ExecRes::Executed),
+            },
+            Instr::Skip => Ok(ExecRes::Skip(
+                xpop()?.try_into().map_err(|_| ExecError::InvalidSkip)?,
+            )),
+            it @ (Instr::Add | Instr::Sub | Instr::Mul | Instr::Div | Instr::Rem) => {
+                let b = xpop()?;
+                let a = xpop()?;
+                stack.push(match it {
+                    Instr::Add => a + b,
+                    Instr::Sub => a - b,
+                    Instr::Mul => a * b,
+                    Instr::Div => a / b,
+                    Instr::Rem => a % b,
+                    _ => unsafe { unreachable_unchecked() }, // TODO: prove,
+                });
                 Ok(ExecRes::Executed)
             }
-            ([.., n], Token::Skip) => {
-                let n = *n;
-                stack.pop();
-                Ok(ExecRes::Skip(
-                    n.try_into().map_err(|_| ExecError::InvalidSkip)?,
-                ))
-            }
-            ([.., n], Token::Pick) if (*n > 0) => {
-                let conv: usize = (*n).try_into().unwrap();
-                stack.pop();
+            Instr::Pick => {
+                let conv: usize = xpop()?.try_into().map_err(|_| ExecError::InvalidPick)?;
                 let got = stack
                     .get::<usize>(stack.len() - conv)
                     .ok_or(ExecError::InvalidPick)?;
@@ -137,25 +143,13 @@ impl ClacState {
 
                 Ok(ExecRes::Executed)
             }
-            (
-                _,
-                Token::Swap
-                | Token::Print
-                | Token::Drop
-                | Token::Rot
-                | Token::If
-                | Token::Pick
-                | Token::Skip,
-            ) => Err(ExecError::MissingArguments),
-            (_, Token::Semicolon) => unreachable!(),
-            (_, Token::Colon) => unreachable!(),
         }
     }
 
     // we have to split execute_line and this version, due to lifetime problems. When you call clac functions, it will be executing in this context, where the FunctionMap CANNOT be modified, since you cannot define functions within a function.
-    fn execute_line_nontop<'cs>(
+    fn exec_function<'cs>(
         funcs: &'cs FuncMap,
-        stack: &mut ClacStack,
+        stack: &mut ValueStack,
         mut callstack: CallStack<'cs>,
     ) -> Result<(), ExecError> {
         while let Some(line) = callstack.pop() {
@@ -164,9 +158,9 @@ impl ClacState {
                 continue;
             };
 
-            let mut optimize_push = |vals: &[Token]| match vals {
+            let mut optimize_push = |vals: &[Instr]| match vals {
                 [] => {}
-                [Token::Literal(n), Token::Skip, rest @ ..]
+                [Instr::Literal(n), Instr::Skip, rest @ ..]
                     if (*n >= 0 && ((*n as usize) == rest.len())) => {}
                 _ => {
                     callstack.push(xs);
@@ -199,83 +193,6 @@ impl ClacState {
         Ok(())
     }
 
-    pub fn execute_tokens_2(&mut self, mut line: &[Token]) -> Result<(), ExecError> {
-        let builder = JITBuilder::with_flags(
-            &[("opt_level", "speed")],
-            cranelift_module::default_libcall_names(),
-        )
-        .unwrap();
-
-        let mut module = cranelift_jit::JITModule::new(builder);
-
-        let mut ctx = module.make_context();
-        let mut fbctx = FunctionBuilderContext::new();
-
-        ctx.func.signature = Signature {
-            params: vec![],
-            returns: vec![AbiParam::new(I64)], //FIXME: mismatch on purpose to test cranelift
-            call_conv: cranelift::prelude::isa::CallConv::SystemV,
-        };
-
-        let mut bu = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
-
-        let b0 = bu.create_block();
-
-        bu.switch_to_block(b0);
-        bu.seal_block(b0);
-
-        let mut vals = Vec::new();
-
-        for tok in line {
-            match tok {
-                Token::Literal(n) => {
-                    vals.push(bu.ins().iconst(I64, *n));
-                }
-                Token::FunctionCall(FunctionRef(InternalFunctionRef::Unresolved(n))) => {
-                    let b = vals.pop().unwrap();
-                    let a = vals.pop().unwrap();
-                    match &**n {
-                        "+" => vals.push(bu.ins().iadd(a, b)),
-                        "-" => vals.push(bu.ins().isub(a, b)),
-                        "*" => vals.push(bu.ins().imul(a, b)),
-                        "/" => vals.push(bu.ins().sdiv(a, b)),
-                        "%" => vals.push(bu.ins().srem(a, b)),
-                        _ => panic!(),
-                    }
-                }
-                _ => unimplemented!(),
-            }
-        }
-
-        // let a = bu.ins().iconst(I64, 60);
-        // let b = bu.ins().iconst(I64, 7);
-
-        // let add = bu.ins().iadd(a, b);
-
-        let _ret = bu.ins().return_(&[vals.pop().unwrap()]);
-
-        // bu.seal_all_blocks(); // FIXME: this should be done
-        bu.finalize();
-        println!("{}", ctx.func.display());
-
-        let dec = module
-            .declare_anonymous_function(&ctx.func.signature)
-            .unwrap();
-        module.define_function(dec, &mut ctx).unwrap();
-
-        // println!("finalize = {:?}", module.finalize_definitions());
-        module.finalize_definitions().unwrap();
-
-        let fun = module.get_finalized_function(dec);
-
-        let casted: fn() -> i64 = unsafe { transmute(fun) };
-
-        println!("fn = {casted:?}");
-        println!("result = {}", casted());
-
-        Ok(())
-    }
-
     /// Execute a slice of [`Token`]s representing a line of Clac++ code.
     pub fn execute_tokens(&mut self, mut line: &[Token]) -> Result<(), ExecError> {
         let mut cur_func: Option<(&String, Code)> = None;
@@ -285,14 +202,9 @@ impl ClacState {
 
         loop {
             (line, cur_func) = match (line, cur_func) {
-                (
-                    [
-                        Token::Colon,
-                        Token::FunctionCall(FunctionRef(InternalFunctionRef::Unresolved(name))),
-                        rem @ ..,
-                    ],
-                    None,
-                ) => (rem, Some((name, Vec::new()))),
+                ([Token::Colon, Token::FunctionCall(name), rem @ ..], None) => {
+                    (rem, Some((name, Vec::new())))
+                }
                 ([Token::Semicolon, rem @ ..], Some((name, f))) => {
                     let len = funcs.functions.len();
 
@@ -316,20 +228,22 @@ impl ClacState {
                     return Err(ExecError::BadFunctionDefinition);
                 }
                 ([tok, rem @ ..], Some((nm, mut f))) => {
-                    f.push(tok.clone());
+                    f.push(tok.clone().token_to_instruction(funcs));
                     (rem, Some((nm, f)))
                 }
-                ([tok, rem @ ..], None) => match Self::execute(funcs, stack, tok)? {
-                    ExecRes::Executed => (rem, None),
-                    ExecRes::Skip(n) => match rem.split_at_checked(n) {
-                        Some((_, rem2)) => (rem2, None),
-                        None => return Err(ExecError::InvalidSkip),
-                    },
-                    ExecRes::RecursiveCall(f) => {
-                        Self::execute_line_nontop(funcs, stack, vec![f])?;
-                        (rem, None)
+                ([tok, rem @ ..], None) => {
+                    match Self::execute(funcs, stack, &tok.clone().token_to_instruction(funcs))? {
+                        ExecRes::Executed => (rem, None),
+                        ExecRes::Skip(n) => match rem.split_at_checked(n) {
+                            Some((_, rem2)) => (rem2, None),
+                            None => return Err(ExecError::InvalidSkip),
+                        },
+                        ExecRes::RecursiveCall(f) => {
+                            Self::exec_function(funcs, stack, vec![f])?;
+                            (rem, None)
+                        }
                     }
-                },
+                }
                 ([], Some(_)) => return Err(ExecError::BadFunctionDefinition),
                 ([], None) => return Ok(()),
             };
@@ -340,27 +254,7 @@ impl ClacState {
     pub fn execute_str(&mut self, line: &str) -> Result<(), ExecError> {
         let parsed: Vec<Token> = line.split_whitespace().map(parse).collect();
 
-        self.execute_tokens_2(&parsed)
-    }
-}
-
-fn name_func_pair_to_funcmap<const N: usize>(xs: [(&str, Function); N]) -> FuncMap {
-    FuncMap {
-        map: ahash::AHashMap::from_iter(
-            xs.iter()
-                .enumerate()
-                .map(|(i, (name, _))| (name.to_string(), i)),
-        ),
-        functions: Vec::from_iter(xs.into_iter().map(|(_, func)| func)),
-    }
-}
-
-impl Default for ClacState {
-    fn default() -> Self {
-        ClacState {
-            stack: Vec::new(),
-            funcmap: name_func_pair_to_funcmap(builtins::FUNCTIONS),
-        }
+        self.execute_tokens(&parsed)
     }
 }
 

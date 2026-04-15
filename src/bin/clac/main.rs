@@ -21,7 +21,7 @@ struct Args {
 fn main() -> Result<(), ReplError> {
     let args = Args::parse();
 
-    let mut state: ClacState = ClacState::with_capacity(args.stack);
+    let mut state: ClacState = ClacState::new(args.stack)?;
 
     if let Some(f) = args.file {
         let mut file = std::fs::File::open(f).expect("Could not open file");

@@ -163,24 +163,24 @@ pub struct ClacState {
     pub(crate) funcmap: FuncMap,
 }
 
-extern "C" fn rpush(stack: *mut ValueStack, val: i64) {
-    match unsafe { stack.as_mut() } {
-        None => exit(67),
-        Some(v) => {
-            v.push(val);
-        }
-    }
-}
+// extern "C" fn rpush(stack: *mut ValueStack, val: i64) {
+//     match unsafe { stack.as_mut() } {
+//         None => exit(67),
+//         Some(v) => {
+//             v.push(val);
+//         }
+//     }
+// }
 
-extern "C" fn rpop(stack: *mut ValueStack) -> Value {
-    match unsafe { stack.as_mut() } {
-        None => exit(68),
-        Some(v) => match v.pop() {
-            None => exit(69),
-            Some(n) => n,
-        },
-    }
-}
+// extern "C" fn rpop(stack: *mut ValueStack) -> Value {
+//     match unsafe { stack.as_mut() } {
+//         None => exit(68),
+//         Some(v) => match v.pop() {
+//             None => exit(69),
+//             Some(n) => n,
+//         },
+//     }
+// }
 
 extern "C" fn quit() {
     exit(0);
@@ -190,9 +190,9 @@ extern "C" fn print_value(val: Value) {
     println!("{}", val)
 }
 
-struct Stack {
+pub(crate) struct Stack {
     data: memmap2::MmapMut,
-    rsp: *mut Value,
+    pub(crate) rsp: *mut Value,
     // TODO: check if compiler optimizes out get head pointer
 }
 
@@ -217,14 +217,14 @@ impl Stack {
         })
     }
 
-    fn push(&mut self, val: Value) {
+    pub(crate) fn push(&mut self, val: Value) {
         unsafe {
             *self.rsp = val;
         }
         self.rsp = self.rsp.wrapping_offset(1);
     }
 
-    fn pop(&mut self) -> Option<Value> {
+    pub(crate) fn pop(&mut self) -> Option<Value> {
         if self.rsp == self.data.as_mut_ptr() as *mut Value {
             None
         } else {
@@ -234,46 +234,49 @@ impl Stack {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum InitError {
+    #[error("Module error: {0}")]
+    ModuleError(#[from] cranelift_module::ModuleError),
+    #[error("IO Error: {0}")]
+    IoError(#[from] io::Error),
+}
+
 impl ClacState {
-    fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Result<Self, InitError> {
         let mut builder = JITBuilder::with_flags(
             &[("opt_level", "speed")],
             cranelift_module::default_libcall_names(),
-        )
-        .unwrap();
+        )?;
 
         builder.symbol("__rprint__", print_value as *const u8);
         builder.symbol("__rquit__", quit as *const u8);
 
         let mut module = cranelift_jit::JITModule::new(builder);
 
-        let printfunc = module
-            .declare_function(
-                "__rprint__",
-                cranelift_module::Linkage::Import,
-                &Signature {
-                    params: vec![AbiParam::new(CRANELIFT_VALUE)],
-                    returns: vec![],
-                    call_conv: module.isa().default_call_conv(),
-                },
-            )
-            .unwrap();
+        let printfunc = module.declare_function(
+            "__rprint__",
+            cranelift_module::Linkage::Import,
+            &Signature {
+                params: vec![AbiParam::new(CRANELIFT_VALUE)],
+                returns: vec![],
+                call_conv: module.isa().default_call_conv(),
+            },
+        )?;
 
-        let quitfunc = module
-            .declare_function(
-                "__rquit__",
-                cranelift_module::Linkage::Import,
-                &Signature {
-                    params: vec![],
-                    returns: vec![],
-                    call_conv: module.isa().default_call_conv(),
-                },
-            )
-            .unwrap();
+        let quitfunc = module.declare_function(
+            "__rquit__",
+            cranelift_module::Linkage::Import,
+            &Signature {
+                params: vec![],
+                returns: vec![],
+                call_conv: module.isa().default_call_conv(),
+            },
+        )?;
 
         let ctx = module.make_context();
 
-        ClacState {
+        Ok(ClacState {
             jit: JITState {
                 module,
                 ctx,
@@ -285,7 +288,7 @@ impl ClacState {
             },
             stack: Stack::new(capacity)?,
             funcmap: name_func_pair_to_funcmap(builtins::FUNCTIONS),
-        }
+        })
     }
 }
 

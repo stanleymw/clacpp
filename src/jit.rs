@@ -1,12 +1,16 @@
-use std::{mem::transmute, process::exit};
+use std::mem::transmute_copy;
 
-use crate::types;
-use cranelift::prelude::{AbiParam, FunctionBuilder, InstBuilder, Signature, Value, types::I64};
-use cranelift_jit::JITBuilder;
+use crate::types::{self, CRANELIFT_VALUE};
+use cranelift::prelude::{
+    AbiParam, FunctionBuilder, InstBuilder, MemFlags, Signature, Value, Variable, types::I64,
+};
+
+use types::Value as ClacValue;
+
 use cranelift_module::{Linkage, Module, ModuleError};
 use thiserror::Error;
 
-type JITFunction = extern "C" fn(*mut types::ValueStack) -> ();
+type JITFunction = unsafe extern "C" fn(*mut ClacValue) -> *mut ClacValue;
 
 #[derive(Debug, Error)]
 pub(crate) enum CompilerError {
@@ -14,6 +18,23 @@ pub(crate) enum CompilerError {
     ModuleError(#[from] ModuleError),
 }
 
+fn emit_push(bu: &mut FunctionBuilder, stack: Variable, val: Value) {
+    let pos = bu.use_var(stack);
+
+    bu.ins().store(MemFlags::new().with_aligned(), val, pos, 0);
+
+    let new_pos = bu.ins().iadd_imm(pos, size_of::<ClacValue>() as i64);
+    bu.def_var(stack, new_pos);
+}
+
+fn emit_pop(bu: &mut FunctionBuilder, stack: Variable) -> Value {
+    let pos = bu.use_var(stack);
+    let new_pos = bu.ins().iadd_imm(pos, -(size_of::<ClacValue>() as i64));
+    bu.def_var(stack, new_pos);
+
+    bu.ins()
+        .load(CRANELIFT_VALUE, MemFlags::new().with_aligned(), new_pos, 0)
+}
 impl types::ClacState {
     pub(crate) fn compile_function(
         &mut self,
@@ -24,19 +45,26 @@ impl types::ClacState {
             ctx,
             fbctx,
             module,
-            imports: types::Imports { pushfunc, popfunc },
+            imports:
+                types::Imports {
+                    printfunc,
+                    quitfunc,
+                },
         } = &mut self.jit;
 
         module.clear_context(ctx);
 
+        let ptr_t = module.isa().pointer_type();
+        let ptr_arg = AbiParam::new(ptr_t);
+
         ctx.func.signature = Signature {
-            params: vec![AbiParam::new(module.isa().pointer_type())], // *mut ValueStack
-            returns: vec![],
+            params: vec![ptr_arg],  // *mut ClacValue
+            returns: vec![ptr_arg], // *mut ClacValue
             call_conv: module.isa().default_call_conv(),
         };
 
-        let popper = module.declare_func_in_func(*popfunc, &mut ctx.func);
-        let pusher = module.declare_func_in_func(*pushfunc, &mut ctx.func);
+        let printfunc = module.declare_func_in_func(*printfunc, &mut ctx.func);
+        let quitfunc = module.declare_func_in_func(*quitfunc, &mut ctx.func);
 
         let mut bu = FunctionBuilder::new(&mut ctx.func, fbctx);
 
@@ -46,7 +74,6 @@ impl types::ClacState {
         bu.seal_block(entry);
 
         // Idea:
-        //
         // 2 levels of stack
         // there is the REAL stack (passed in pointer)
         // and also a build/function stack (*mut ClacStack)
@@ -56,14 +83,16 @@ impl types::ClacState {
         // must also flush before Pick
         //
         // then every function is fn(*mut ClacStack) -> ()
-        //
         let stack = bu.block_params(entry)[0];
+        let stack_var = bu.declare_var(module.isa().pointer_type());
+        bu.def_var(stack_var, stack);
+        let stack = stack_var;
 
         let mut tmp: Vec<Value> = Vec::new();
 
         let flush = |tmp: &mut Vec<Value>, bu: &mut FunctionBuilder| {
             for val in &*tmp {
-                bu.ins().call(pusher, &[stack, *val]);
+                emit_push(bu, stack, *val);
             }
 
             tmp.clear();
@@ -75,12 +104,8 @@ impl types::ClacState {
         //     })
         // };
 
-        let mut xpop = |tmp: &mut Vec<Value>, bu: &mut FunctionBuilder| {
-            tmp.pop().unwrap_or_else(|| {
-                let call_instr = bu.ins().call(popper, &[stack]);
-                let results = bu.inst_results(call_instr);
-                results[0]
-            })
+        let xpop = |tmp: &mut Vec<Value>, bu: &mut FunctionBuilder| {
+            tmp.pop().unwrap_or_else(|| emit_pop(bu, stack))
         };
 
         for inst in line {
@@ -103,21 +128,45 @@ impl types::ClacState {
                         _ => unreachable!(),
                     });
                 }
+                Instr::Swap => {
+                    let b = xpop(&mut tmp, &mut bu);
+                    let a = xpop(&mut tmp, &mut bu);
+
+                    tmp.push(b);
+                    tmp.push(a);
+                }
+                Instr::Rot => {
+                    let z = xpop(&mut tmp, &mut bu);
+                    let y = xpop(&mut tmp, &mut bu);
+                    let x = xpop(&mut tmp, &mut bu);
+
+                    tmp.push(y);
+                    tmp.push(z);
+                    tmp.push(x);
+                }
                 Instr::Drop => {
                     xpop(&mut tmp, &mut bu);
                 }
-                _ => unimplemented!(),
+                Instr::Print => {
+                    let popped = xpop(&mut tmp, &mut bu);
+                    bu.ins().call(printfunc, &[popped]);
+                }
+                Instr::Quit => {
+                    bu.ins().call(quitfunc, &[]);
+                }
+                _ => todo!(),
             }
         }
 
         flush(&mut tmp, &mut bu);
 
-        let _ret = bu.ins().return_(&[]);
+        let final_stack = bu.use_var(stack);
+        let _ret = bu.ins().return_(&[final_stack]);
 
         bu.seal_all_blocks(); // FIXME: investigate
         bu.finalize();
 
-        println!("{}", ctx.func.display());
+        println!("Pre-optimize: {}", ctx.func.display());
 
         let id = module.declare_function(name, Linkage::Local, &ctx.func.signature)?;
         module.define_function(id, ctx)?;
@@ -125,8 +174,10 @@ impl types::ClacState {
         module.finalize_definitions()?;
 
         let fun = module.get_finalized_function(id);
+
+        println!("Optimized: {}", ctx.func.display());
         println!("JIT compiled function = {:?}", fun);
 
-        Ok(unsafe { transmute(fun) })
+        Ok(unsafe { transmute_copy(&fun) })
     }
 }

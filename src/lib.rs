@@ -52,7 +52,7 @@ fn parse(token: &str) -> Token {
 impl ClacState {
     fn execute<'cs>(
         functions: &'cs FuncMap,
-        stack: &mut ValueStack,
+        stack: &mut Stack,
         token: &Instr,
     ) -> Result<ExecRes<'cs>, ExecError> {
         let mut xpop = || stack.pop().ok_or(ExecError::MissingArguments);
@@ -75,7 +75,8 @@ impl ClacState {
                 match f {
                     Function::Clac(f) => Ok(ExecRes::RecursiveCall(f)),
                     Function::Native(f) => {
-                        f(stack);
+                        // f(stack);
+                        todo!();
                         Ok(ExecRes::Executed)
                     }
                     Function::ClacOp(f) => {
@@ -100,7 +101,10 @@ impl ClacState {
                 Ok(ExecRes::Executed)
             }
             Instr::Swap => {
-                let [.., a, b] = stack.as_mut_slice() else {
+                // let [.., a, b] = stack.as_mut_slice() else {
+                //     return Err(ExecError::MissingArguments);
+                // };
+                let [.., a, b]: &mut [Value] = todo!() else {
                     return Err(ExecError::MissingArguments);
                 };
 
@@ -108,7 +112,7 @@ impl ClacState {
                 Ok(ExecRes::Executed)
             }
             Instr::Rot => {
-                let [.., x, y, z] = stack.as_mut_slice() else {
+                let [.., x, y, z]: &mut [Value] = todo!() else {
                     return Err(ExecError::MissingArguments);
                 };
                 (*x, *y, *z) = (*y, *z, *x);
@@ -136,9 +140,10 @@ impl ClacState {
             }
             Instr::Pick => {
                 let conv: usize = xpop()?.try_into().map_err(|_| ExecError::InvalidPick)?;
-                let got = stack
-                    .get::<usize>(stack.len() - conv)
-                    .ok_or(ExecError::InvalidPick)?;
+                // let got = stack
+                //     .get::<usize>(stack.len() - conv)
+                //     .ok_or(ExecError::InvalidPick)?;
+                let got: &mut Value = todo!();
 
                 stack.push(*got);
 
@@ -150,7 +155,7 @@ impl ClacState {
     // we have to split execute_line and this version, due to lifetime problems. When you call clac functions, it will be executing in this context, where the FunctionMap CANNOT be modified, since you cannot define functions within a function.
     fn exec_function<'cs>(
         funcs: &'cs FuncMap,
-        stack: &mut ValueStack,
+        stack: &mut Stack,
         mut callstack: CallStack<'cs>,
     ) -> Result<(), ExecError> {
         while let Some(line) = callstack.pop() {
@@ -209,12 +214,16 @@ impl ClacState {
                 ([Token::Semicolon, rem @ ..], Some((name, f))) => {
                     let len = funcs.functions.len();
 
-                    // let compiled = self.compile_function(name, &f).unwrap();
+                    let compiled = self.compile_function(name, &f).unwrap();
 
-                    // funcs = &mut self.funcmap;
-                    // stack = &mut self.stack;
+                    funcs = &mut self.funcmap;
+                    stack = &mut self.stack;
 
-                    // compiled(stack);
+                    println!("Compiled = {compiled:?}");
+                    // unsafe { std::arch::asm!("int3") };
+
+                    let new_rsp = unsafe { compiled(stack.rsp) };
+                    stack.rsp = new_rsp;
 
                     // if we are re-defining a function, we should replace
                     match funcs.map.get(name) {
@@ -273,6 +282,9 @@ pub enum ReplError {
 
     #[error("Readline Error: {0}")]
     LineError(#[from] ReadlineError),
+
+    #[error("Init error: {0}")]
+    InitError(#[from] InitError),
 }
 
 /// Launch an interactive REPL on the provided ClacState.

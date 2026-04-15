@@ -10,6 +10,10 @@ unsafe extern "C" {
     fn syscall(num: c_long, ...) -> c_long;
 }
 
+pub(crate) fn pow(x: Value, y: Value) -> Option<Value> {
+    Some(x.pow(y.try_into().ok()?))
+}
+
 pub const FUNCTIONS: [(&str, Function); 14] = [
     ("+", ArithInstr(Arith::Add)),
     ("-", ArithInstr(Arith::Sub)),
@@ -17,13 +21,7 @@ pub const FUNCTIONS: [(&str, Function); 14] = [
     ("/", ArithInstr(Arith::Div)),
     ("%", ArithInstr(Arith::Rem)),
     ("<", ArithInstr(Arith::Lt)),
-    (
-        "**",
-        ClacOp(|x, y| match y.try_into() {
-            Ok(conv) => Value::pow(x, conv),
-            Err(err) => panic!("Pow error: {}", err),
-        }),
-    ),
+    ("**", ArithInstr(Arith::Pow)),
     (
         "read8",
         Native(|stack| {

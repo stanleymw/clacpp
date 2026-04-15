@@ -77,13 +77,6 @@ impl ClacState {
                         f(stack);
                         Ok(ExecRes::Executed)
                     }
-                    Function::ClacOp(f) => {
-                        let y = xpop()?;
-                        let x = xpop()?;
-
-                        stack.push(f(x, y));
-                        Ok(ExecRes::Executed)
-                    }
                     Function::ArithInstr(_) => unreachable!(
                         "Tried to execute an ArithInstr as a function call, which should be impossible if this instruction was obtained from a token by token_to_instruction"
                     ),
@@ -146,6 +139,7 @@ impl ClacState {
                             0
                         }
                     }
+                    Arith::Pow => builtins::pow(a, b).ok_or(ExecError::InvalidExponent)?,
                 });
                 Ok(ExecRes::Executed)
             }

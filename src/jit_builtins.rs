@@ -1,7 +1,19 @@
 use thiserror::Error;
 
+use crate::{builtins, types};
+
 pub(crate) extern "C" fn quit() {
     std::process::exit(0);
+}
+
+pub(crate) extern "C" fn pow(x: types::Value, y: types::Value) -> types::Value {
+    match builtins::pow(x, y) {
+        Some(res) => res,
+        None => {
+            eprintln!("Must pow with a non-negative exponent!");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -13,9 +25,9 @@ pub(crate) enum CompiledExecutionError {
 
 pub(crate) extern "C" fn error(err: CompiledExecutionError) {
     eprintln!("{}", err);
-    std::process::exit(0);
+    std::process::exit(1);
 }
 
-pub(crate) extern "C" fn print_value(val: crate::types::Value) {
+pub(crate) extern "C" fn print_value(val: types::Value) {
     println!("{}", val)
 }

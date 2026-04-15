@@ -33,7 +33,11 @@ pub(crate) enum Arith {
     Div,
     Rem,
     Lt,
+    Pow,
 }
+
+#[derive(Debug, Clone)]
+pub(crate) enum Mem {}
 
 #[derive(Debug)]
 // Internal clac instruction
@@ -52,6 +56,7 @@ pub(crate) enum Instr {
     Rot,
 
     Arith(Arith),
+    // Mem(Mem),
 
     // Math Instructions
     If,
@@ -126,8 +131,6 @@ pub(crate) enum Function {
     Compiled(JITFunction),
 
     ArithInstr(Arith),
-
-    ClacOp(fn(Value, Value) -> Value),
 }
 
 pub(crate) type CallStack<'a> = Vec<&'a [Instr]>;
@@ -149,9 +152,11 @@ fn name_func_pair_to_funcmap<const N: usize>(xs: [(&str, Function); N]) -> FuncM
     }
 }
 
+// TODO: make a macro to do this
 pub(crate) struct Imports {
     pub(crate) printfunc: FuncId,
     pub(crate) quitfunc: FuncId,
+    pub(crate) powfunc: FuncId,
 
     pub(crate) errorfunc: FuncId,
 }
@@ -255,14 +260,17 @@ impl ClacState {
         builder.symbol("__rprint__", jit_builtins::print_value as *const u8);
         builder.symbol("__rquit__", jit_builtins::quit as *const u8);
         builder.symbol("__rerr__", jit_builtins::error as *const u8);
+        builder.symbol("__rpow__", jit_builtins::pow as *const u8);
 
         let mut module = cranelift_jit::JITModule::new(builder);
+
+        let valparam = AbiParam::new(CRANELIFT_VALUE);
 
         let printfunc = module.declare_function(
             "__rprint__",
             cranelift_module::Linkage::Import,
             &Signature {
-                params: vec![AbiParam::new(CRANELIFT_VALUE)],
+                params: vec![valparam],
                 returns: vec![],
                 call_conv: module.isa().default_call_conv(),
             },
@@ -272,7 +280,7 @@ impl ClacState {
             "__rerror__",
             cranelift_module::Linkage::Import,
             &Signature {
-                params: vec![AbiParam::new(CRANELIFT_VALUE)],
+                params: vec![valparam],
                 returns: vec![],
                 call_conv: module.isa().default_call_conv(),
             },
@@ -288,6 +296,16 @@ impl ClacState {
             },
         )?;
 
+        let powfunc = module.declare_function(
+            "__rpow__",
+            cranelift_module::Linkage::Import,
+            &Signature {
+                params: vec![valparam, valparam],
+                returns: vec![valparam],
+                call_conv: module.isa().default_call_conv(),
+            },
+        )?;
+
         let ctx = module.make_context();
 
         Ok(ClacState {
@@ -299,6 +317,7 @@ impl ClacState {
                     printfunc: printfunc,
                     quitfunc: quitfunc,
                     errorfunc: errorfunc,
+                    powfunc: powfunc,
                 },
             },
             stack: Stack::new(capacity)?,
@@ -325,6 +344,8 @@ pub enum ExecError {
     InvalidPick,
     #[error("Bad function definition")]
     BadFunctionDefinition,
+    #[error("Invalid exponent, must have non-negative exponent")]
+    InvalidExponent,
     #[error("Quit")]
     Quit,
 }

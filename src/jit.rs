@@ -1,12 +1,8 @@
 use std::mem::transmute_copy;
 
 use crate::types::{self, Arith, CRANELIFT_VALUE};
-use cranelift::{
-    codegen::control::ControlPlane,
-    prelude::{
-        AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, Value, Variable,
-        types::I64,
-    },
+use cranelift::prelude::{
+    AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, Value, Variable, types::I64,
 };
 
 use types::Value as ClacValue;
@@ -66,6 +62,7 @@ impl types::ClacState {
                     printfunc,
                     quitfunc,
                     errorfunc,
+                    powfunc,
                 },
         } = &mut self.jit;
 
@@ -83,6 +80,7 @@ impl types::ClacState {
         let printfunc = module.declare_func_in_func(*printfunc, &mut ctx.func);
         let quitfunc = module.declare_func_in_func(*quitfunc, &mut ctx.func);
         let errorfunc = module.declare_func_in_func(*errorfunc, &mut ctx.func);
+        let powfunc = module.declare_func_in_func(*powfunc, &mut ctx.func);
 
         let mut bu = FunctionBuilder::new(&mut ctx.func, fbctx);
 
@@ -151,6 +149,10 @@ impl types::ClacState {
                         Arith::Div => bu.ins().sdiv(a, b),
                         Arith::Rem => bu.ins().srem(a, b),
                         Arith::Lt => bu.ins().icmp(IntCC::SignedLessThan, a, b),
+                        Arith::Pow => {
+                            let call = bu.ins().call(powfunc, &[a, b]);
+                            bu.inst_results(call)[0]
+                        }
                     });
                 }
                 Instr::Swap => {

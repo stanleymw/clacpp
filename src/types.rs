@@ -110,11 +110,14 @@ pub(crate) type Code = Vec<Instr>;
 //     code: Code,
 // }
 
+pub(crate) type JITFunction = unsafe extern "C" fn(*mut Value) -> *mut Value;
+
 #[derive(Debug)]
 pub(crate) enum Function {
     Clac(Code),
 
-    Native(fn(&mut ValueStack)),
+    Native(fn(&mut Stack)),
+    Compiled(JITFunction),
 
     ClacInstr(Instr),
 

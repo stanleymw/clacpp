@@ -75,8 +75,7 @@ impl ClacState {
                 match f {
                     Function::Clac(f) => Ok(ExecRes::RecursiveCall(f)),
                     Function::Native(f) => {
-                        // f(stack);
-                        todo!();
+                        f(stack);
                         Ok(ExecRes::Executed)
                     }
                     Function::ClacOp(f) => {
@@ -89,6 +88,12 @@ impl ClacState {
                     Function::ClacInstr(_) => unreachable!(
                         "Tried to execute a ClacInstr as a function call, which should be impossible if this instruction was obtained from a token by token_to_instruction"
                     ),
+                    Function::Compiled(f) => {
+                        let new_rsp = unsafe { f(stack.rsp) };
+                        stack.rsp = new_rsp;
+
+                        Ok(ExecRes::Executed)
+                    }
                 }
             }
 
@@ -101,21 +106,22 @@ impl ClacState {
                 Ok(ExecRes::Executed)
             }
             Instr::Swap => {
-                // let [.., a, b] = stack.as_mut_slice() else {
-                //     return Err(ExecError::MissingArguments);
-                // };
-                let [.., a, b]: &mut [Value] = todo!() else {
-                    return Err(ExecError::MissingArguments);
-                };
+                let b = xpop()?;
+                let a = xpop()?;
 
-                std::mem::swap(a, b);
+                stack.push(b);
+                stack.push(a);
+
                 Ok(ExecRes::Executed)
             }
             Instr::Rot => {
-                let [.., x, y, z]: &mut [Value] = todo!() else {
-                    return Err(ExecError::MissingArguments);
-                };
-                (*x, *y, *z) = (*y, *z, *x);
+                let z = xpop()?;
+                let y = xpop()?;
+                let x = xpop()?;
+
+                stack.push(y);
+                stack.push(z);
+                stack.push(x);
                 Ok(ExecRes::Executed)
             }
             Instr::If => match xpop()? {
@@ -214,7 +220,7 @@ impl ClacState {
                 ([Token::Semicolon, rem @ ..], Some((name, f))) => {
                     let len = funcs.functions.len();
 
-                    let compiled = self.compile_function(name, &f).unwrap();
+                    let compiled = self.compile_function(&f).unwrap();
 
                     funcs = &mut self.funcmap;
                     stack = &mut self.stack;
@@ -222,16 +228,13 @@ impl ClacState {
                     println!("Compiled = {compiled:?}");
                     // unsafe { std::arch::asm!("int3") };
 
-                    let new_rsp = unsafe { compiled(stack.rsp) };
-                    stack.rsp = new_rsp;
-
                     // if we are re-defining a function, we should replace
                     match funcs.map.get(name) {
                         Some(idx) => {
-                            funcs.functions[*idx] = Function::Clac(f);
+                            funcs.functions[*idx] = Function::Compiled(compiled);
                         }
                         None => {
-                            funcs.functions.push(Function::Clac(f));
+                            funcs.functions.push(Function::Compiled(compiled));
                             funcs.map.insert(name.to_string(), len);
                         }
                     };

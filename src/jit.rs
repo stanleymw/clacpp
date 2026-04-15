@@ -10,8 +10,6 @@ use types::Value as ClacValue;
 use cranelift_module::{Linkage, Module, ModuleError};
 use thiserror::Error;
 
-type JITFunction = unsafe extern "C" fn(*mut ClacValue) -> *mut ClacValue;
-
 #[derive(Debug, Error)]
 pub(crate) enum CompilerError {
     #[error("Module (cranelift) Error: {0}")]
@@ -38,9 +36,8 @@ fn emit_pop(bu: &mut FunctionBuilder, stack: Variable) -> Value {
 impl types::ClacState {
     pub(crate) fn compile_function(
         &mut self,
-        name: &str,
         line: &[types::Instr],
-    ) -> Result<JITFunction, CompilerError> {
+    ) -> Result<types::JITFunction, CompilerError> {
         let types::JITState {
             ctx,
             fbctx,
@@ -168,7 +165,8 @@ impl types::ClacState {
 
         println!("Pre-optimize: {}", ctx.func.display());
 
-        let id = module.declare_function(name, Linkage::Local, &ctx.func.signature)?;
+        // TODO: if cranelift adds an ability to free previously declared functions, we should do that.
+        let id = module.declare_anonymous_function(&ctx.func.signature)?;
         module.define_function(id, ctx)?;
 
         module.finalize_definitions()?;

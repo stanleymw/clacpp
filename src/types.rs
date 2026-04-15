@@ -125,7 +125,7 @@ pub(crate) type JITFunction = unsafe extern "C" fn(*mut Value) -> *mut Value;
 
 #[derive(Debug)]
 pub(crate) enum Function {
-    Clac(Code),
+    Uncompiled(Code),
 
     Native(fn(&mut Stack)),
     Compiled(JITFunction),

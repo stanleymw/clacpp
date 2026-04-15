@@ -1,6 +1,7 @@
-use std::mem::transmute_copy;
+use std::{collections::BTreeSet, mem::transmute_copy};
 
-use crate::types::{self, Arith, CRANELIFT_VALUE};
+use crate::types::{self, Arith, CRANELIFT_VALUE, Instr};
+use ahash::{HashSet, HashSetExt};
 use cranelift::prelude::{
     AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, Value, Variable, types::I64,
 };
@@ -9,6 +10,10 @@ use types::Value as ClacValue;
 
 use cranelift_module::{Module, ModuleError};
 use thiserror::Error;
+
+pub enum JITError {
+    IndeterminateControlFlow,
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum CompilerError {
@@ -48,6 +53,61 @@ fn emit_pick(bu: &mut FunctionBuilder, stack: Variable, offset: Value) {
     emit_push(bu, stack, loaded);
 }
 
+#[cfg(debug_assertions)]
+fn debug_simulate_breaks(func: &[types::Instr]) {}
+
+fn get_block_breaks(func: &[types::Instr]) -> Option<BTreeSet<usize>> {
+    let mut ret: BTreeSet<usize> = BTreeSet::new();
+
+    let insert_checked = |set: &mut BTreeSet<usize>, val: usize| -> Option<bool> {
+        if val <= func.len() {
+            Some(set.insert(val))
+        } else {
+            None
+        }
+    };
+
+    for (i, instr) in func.iter().enumerate() {
+        println!("{} {:?}", i, instr);
+        match instr {
+            Instr::If => {
+                // you can jump ahead by a fixed amount
+                insert_checked(&mut ret, i + 4)?;
+            }
+            Instr::Skip => {
+                // 2 cases:
+                // if there is no BREAK at this position, and the previous value is a constant, then we are guaranteed to know how much we are going to jump by.
+                // assuming that we have found all of the breaks up to this point. (TODO: PROVE THIS IS CORRECT)
+                if !ret.contains(&i)
+                    && let Some(Instr::Literal(n)) = func.get(i - 1)
+                {
+                    // no break here, we can use constant optimization
+                    match n {
+                        0 => {} // 0 skip does nothing
+                        n => {
+                            let conv: usize = (*n).try_into().ok()?;
+
+                            let new: usize = i + conv + 1;
+                            insert_checked(&mut ret, new)?;
+                        }
+                    }
+                } else {
+                    for new in (i + 2)..=func.len() {
+                        ret.insert(new);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for i in &ret {
+        debug_assert!(*i <= func.len());
+    }
+
+    Some(ret)
+}
+
 impl types::ClacState {
     pub(crate) fn compile_function(
         &mut self,
@@ -65,6 +125,10 @@ impl types::ClacState {
                     powfunc,
                 },
         } = &mut self.jit;
+
+        println!("{:?}", get_block_breaks(line).unwrap());
+
+        return todo!();
 
         module.clear_context(ctx);
 

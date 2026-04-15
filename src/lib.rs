@@ -10,7 +10,7 @@ use types::*;
 // resolve functions so we don't need to do a costly hashmap lookup
 fn resolve_funcmap(funcs: &mut FuncMap) {
     for function in &mut funcs.functions {
-        if let Function::Clac(f) = function {
+        if let Function::Uncompiled(f) = function {
             for token in f {
                 if let Instr::FunctionCall(FuncRef::Unresolved(name)) = token
                     && let Some(resolved) = funcs.map.get(name)
@@ -72,7 +72,7 @@ impl ClacState {
                 };
 
                 match f {
-                    Function::Clac(f) => Ok(ExecRes::RecursiveCall(f)),
+                    Function::Uncompiled(f) => Ok(ExecRes::RecursiveCall(f)),
                     Function::Native(f) => {
                         f(stack);
                         Ok(ExecRes::Executed)

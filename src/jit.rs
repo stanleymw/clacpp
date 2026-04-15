@@ -1,8 +1,12 @@
 use std::mem::transmute_copy;
 
 use crate::types::{self, Arith, CRANELIFT_VALUE};
-use cranelift::prelude::{
-    AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, Value, Variable, types::I64,
+use cranelift::{
+    codegen::control::ControlPlane,
+    prelude::{
+        AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, Value, Variable,
+        types::I64,
+    },
 };
 
 use types::Value as ClacValue;
@@ -176,7 +180,7 @@ impl types::ClacState {
                     bu.ins().call(quitfunc, &[]);
                 }
                 Instr::Pick => xpick(&mut tmp, &mut bu),
-                _ => todo!(),
+                _instr => todo!("{:?}", _instr),
             }
         }
 
@@ -193,13 +197,11 @@ impl types::ClacState {
         // TODO: if cranelift adds an ability to free previously declared functions, we should do that.
         let id = module.declare_anonymous_function(&ctx.func.signature)?;
         module.define_function(id, ctx)?;
-
         module.finalize_definitions()?;
 
         let fun = module.get_finalized_function(id);
 
         println!("Optimized: {}", ctx.func.display());
-        println!("JIT compiled function = {:?}", fun);
 
         Ok(unsafe { transmute_copy(&fun) })
     }

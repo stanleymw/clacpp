@@ -227,10 +227,10 @@ impl ClacState {
 
                     let compiled = self.compile_function(&f).unwrap();
 
+                    println!("JIT compiled function {} -> {:?}", name, compiled);
+
                     funcs = &mut self.funcmap;
                     stack = &mut self.stack;
-
-                    // unsafe { std::arch::asm!("int3") };
 
                     // if we are re-defining a function, we should replace
                     match funcs.map.get(name) {
@@ -302,9 +302,17 @@ pub fn repl(state: &mut ClacState, hide_stack: bool) -> Result<(), ReplError> {
 
     loop {
         let read = match editor.readline("clac++> ") {
-            Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => return Ok(()),
+            Err(ReadlineError::Eof) => return Ok(()),
+            Err(ReadlineError::Interrupted) => {
+                // TODO: remove
+                unsafe { std::arch::asm!("int3") };
+                continue;
+            }
             Err(e) => return Err(e.into()),
-            Ok(res) => res,
+            Ok(res) => {
+                editor.add_history_entry(&res)?;
+                res
+            }
         };
 
         match state.execute_str(&read) {

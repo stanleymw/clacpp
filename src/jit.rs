@@ -10,7 +10,7 @@ use cranelift::{
     frontend::Switch,
     prelude::{
         AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, TrapCode, Value,
-        Variable, types::I64,
+        Variable, isa::CallConv, types::I64,
     },
 };
 
@@ -398,14 +398,14 @@ impl JITState {
         unsafe { transmute_copy(&self.module.get_finalized_function(func)) }
     }
 
-    fn generate_signature(&self) -> Signature {
+    fn generate_signature(&self, callconv: CallConv) -> Signature {
         let ptr_t = self.module.isa().pointer_type();
         let ptr_arg = AbiParam::new(ptr_t);
 
         Signature {
             params: vec![ptr_arg],  // *mut ClacValue
             returns: vec![ptr_arg], // *mut ClacValue
-            call_conv: cranelift::prelude::isa::CallConv::Tail,
+            call_conv: callconv,
         }
     }
 
@@ -442,6 +442,38 @@ impl JITState {
         Ok(ret)
     }
 
+    pub(crate) fn create_wrapper(&mut self, target: FuncId) -> ModuleResult<FuncId> {
+        self.module.clear_context(&mut self.ctx);
+
+        self.ctx.func.signature = self.generate_signature(self.module.isa().default_call_conv());
+
+        let target = self.module.declare_func_in_func(target, &mut self.ctx.func);
+
+        let mut bu = FunctionBuilder::new(&mut self.ctx.func, &mut self.fbctx);
+        let entry = bu.create_block();
+        bu.switch_to_block(entry);
+        bu.seal_block(entry);
+
+        bu.append_block_params_for_function_params(entry);
+
+        let stack = bu.block_params(entry)[0];
+
+        let ret = bu.ins().call(target, &[stack]);
+        let ret = bu.inst_results(ret)[0];
+
+        bu.ins().return_(&[ret]);
+
+        bu.finalize();
+
+        let dec = self
+            .module
+            .declare_anonymous_function(&self.ctx.func.signature)?;
+
+        self.module.define_function(dec, &mut self.ctx)?;
+
+        Ok(dec)
+    }
+
     pub(crate) fn compile_function(
         &mut self,
         id: FuncId,
@@ -450,7 +482,7 @@ impl JITState {
     ) -> Result<(), CompilerError> {
         self.module.clear_context(&mut self.ctx);
 
-        let sig = self.generate_signature();
+        let sig = self.generate_signature(CallConv::Tail);
 
         let callees = self.build_callee_map(line, funcs)?;
         println!("Callees = {:?}", callees);
@@ -533,6 +565,8 @@ impl types::ClacState {
         // compile all functions
         self.compile_all();
 
+        self.create_and_set_wrappers()?;
+
         self.jit.module.finalize_definitions()?;
 
         for (name, idx) in &self.funcmap.map {
@@ -546,6 +580,16 @@ impl types::ClacState {
             }
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn create_and_set_wrappers(&mut self) -> ModuleResult<()> {
+        for function in &mut self.funcmap.functions {
+            if let Function::User(funcid, _) = function {
+                *funcid = Some(self.jit.create_wrapper(funcid.unwrap())?);
+                println!("Generated wrapper: {funcid:?}");
+            }
+        }
         Ok(())
     }
 
@@ -568,7 +612,7 @@ impl types::ClacState {
     }
 
     pub(crate) fn declare_functions_in_jit_module(&mut self) -> ModuleResult<()> {
-        let sig = self.jit.generate_signature();
+        let sig = self.jit.generate_signature(CallConv::Tail);
 
         for function in &mut self.funcmap.functions {
             if let Function::User(funcid, code) = function {

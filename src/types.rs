@@ -125,10 +125,9 @@ pub(crate) type JITFunction = unsafe extern "C" fn(*mut Value) -> *mut Value;
 
 #[derive(Debug)]
 pub(crate) enum Function {
-    Uncompiled(Code),
-
     Native(fn(&mut Stack)),
-    Compiled(JITFunction),
+
+    User(Option<FuncId>, Code),
 
     ArithInstr(Arith),
 }
@@ -251,7 +250,7 @@ pub enum InitError {
 }
 
 impl JITState {
-    fn new() -> Result<Self, InitError> {
+    pub(crate) fn new() -> Result<Self, InitError> {
         let mut builder = JITBuilder::with_flags(
             &[("opt_level", "speed"), ("enable_alias_analysis", "true")],
             cranelift_module::default_libcall_names(),

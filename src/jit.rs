@@ -3,8 +3,7 @@ use std::{
     mem::transmute_copy,
 };
 
-use crate::types::{self, Arith, CRANELIFT_VALUE, Instr};
-use ahash::{HashMapExt, HashSet, HashSetExt};
+use crate::types::{self, Arith, CRANELIFT_VALUE, Function, Instr, JITFunction, JITState};
 use cranelift::{
     codegen::ir::FuncRef,
     frontend::Switch,
@@ -16,7 +15,7 @@ use cranelift::{
 
 use types::Value as ClacValue;
 
-use cranelift_module::{Module, ModuleError};
+use cranelift_module::{FuncId, Module, ModuleError, ModuleResult};
 use thiserror::Error;
 
 pub enum JITError {
@@ -326,11 +325,28 @@ struct ImportRefs {
     powfunc: FuncRef,
 }
 
-impl types::ClacState {
+impl JITState {
+    pub(crate) fn get_function(&self, func: FuncId) -> JITFunction {
+        unsafe { transmute_copy(&self.module.get_finalized_function(func)) }
+    }
+
+    fn generate_signature(&self) -> Signature {
+        let ptr_t = self.module.isa().pointer_type();
+        let ptr_arg = AbiParam::new(ptr_t);
+
+        Signature {
+            params: vec![ptr_arg],  // *mut ClacValue
+            returns: vec![ptr_arg], // *mut ClacValue
+            call_conv: self.module.isa().default_call_conv(),
+        }
+    }
+
     pub(crate) fn compile_function(
         &mut self,
+        id: FuncId,
         line: &[types::Instr],
-    ) -> Result<types::JITFunction, CompilerError> {
+    ) -> Result<(), CompilerError> {
+        let sig = self.generate_signature();
         let types::JITState {
             ctx,
             fbctx,
@@ -342,18 +358,10 @@ impl types::ClacState {
                     errorfunc,
                     powfunc,
                 },
-        } = &mut self.jit;
+        } = self;
 
         module.clear_context(ctx);
-
-        let ptr_t = module.isa().pointer_type();
-        let ptr_arg = AbiParam::new(ptr_t);
-
-        ctx.func.signature = Signature {
-            params: vec![ptr_arg],  // *mut ClacValue
-            returns: vec![ptr_arg], // *mut ClacValue
-            call_conv: module.isa().default_call_conv(),
-        };
+        ctx.func.signature = sig;
 
         let refs = ImportRefs {
             printfunc: module.declare_func_in_func(*printfunc, &mut ctx.func),
@@ -393,17 +401,52 @@ impl types::ClacState {
         // bu.seal_all_blocks(); // FIXME: investigate
         bu.finalize();
 
-        println!("Pre-optimize: {}", ctx.func.display());
-
         // TODO: if cranelift adds an ability to free previously declared functions, we should do that.
-        let id = module.declare_anonymous_function(&ctx.func.signature)?;
         module.define_function(id, ctx)?;
-        module.finalize_definitions()?;
 
-        let fun = module.get_finalized_function(id);
+        Ok(())
+    }
+}
 
-        println!("Optimized: {}", ctx.func.display());
+impl types::ClacState {
+    pub(crate) fn declare_and_compile_all_functions(&mut self) -> ModuleResult<()> {
+        // declare all functions
+        self.declare_functions_in_jit_module()?;
 
-        Ok(unsafe { transmute_copy(&fun) })
+        // compile all functions
+        self.compile_all()?;
+
+        self.jit.module.finalize_definitions()?;
+
+        Ok(())
+    }
+
+    pub(crate) fn compile_all(&mut self) -> ModuleResult<()> {
+        for function in &mut self.funcmap.functions {
+            if let Function::User(fid, code) = function {
+                match self.jit.compile_function((*fid).unwrap(), code) {
+                    Ok(()) => {
+                        println!("Successfully compiled {fid:?} (code = {code:?})");
+                    }
+                    Err(err) => {
+                        println!("Could not compile {fid:?} because {err} (code = {code:?})",);
+                        *fid = None;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn declare_functions_in_jit_module(&mut self) -> ModuleResult<()> {
+        let sig = self.jit.generate_signature();
+
+        for function in &mut self.funcmap.functions {
+            if let Function::User(funcid, _) = function {
+                *funcid = Some(self.jit.module.declare_anonymous_function(&sig)?);
+            }
+        }
+
+        Ok(())
     }
 }

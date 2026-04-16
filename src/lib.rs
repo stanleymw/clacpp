@@ -10,7 +10,7 @@ use types::*;
 // resolve functions so we don't need to do a costly hashmap lookup
 fn resolve_funcmap(funcs: &mut FuncMap) {
     for function in &mut funcs.functions {
-        if let Function::Uncompiled(f) = function {
+        if let Function::User(_, f) = function {
             for token in f {
                 if let Instr::FunctionCall(FuncRef::Unresolved(name)) = token
                     && let Some(resolved) = funcs.map.get(name)
@@ -52,6 +52,7 @@ impl ClacState {
     fn execute<'cs>(
         functions: &'cs FuncMap,
         stack: &mut Stack,
+        jit: &JITState,
         token: &Instr,
     ) -> Result<ExecRes<'cs>, ExecError> {
         let mut xpop = || stack.pop().ok_or(ExecError::MissingArguments);
@@ -72,7 +73,6 @@ impl ClacState {
                 };
 
                 match f {
-                    Function::Uncompiled(f) => Ok(ExecRes::RecursiveCall(f)),
                     Function::Native(f) => {
                         f(stack);
                         Ok(ExecRes::Executed)
@@ -80,12 +80,17 @@ impl ClacState {
                     Function::ArithInstr(_) => unreachable!(
                         "Tried to execute an ArithInstr as a function call, which should be impossible if this instruction was obtained from a token by token_to_instruction"
                     ),
-                    Function::Compiled(f) => {
-                        let new_rsp = unsafe { f(stack.rsp) };
-                        stack.rsp = new_rsp;
+                    Function::User(fid, code) => match fid {
+                        Some(compiled) => {
+                            let asm = jit.get_function(*compiled);
 
-                        Ok(ExecRes::Executed)
-                    }
+                            let new_rsp = unsafe { asm(stack.rsp) };
+                            stack.rsp = new_rsp;
+
+                            Ok(ExecRes::Executed)
+                        }
+                        None => Ok(ExecRes::RecursiveCall(code)),
+                    },
                 }
             }
 
@@ -161,6 +166,7 @@ impl ClacState {
     fn exec_function<'cs>(
         funcs: &'cs FuncMap,
         stack: &mut Stack,
+        jit: &JITState,
         mut callstack: CallStack<'cs>,
     ) -> Result<(), ExecError> {
         while let Some(line) = callstack.pop() {
@@ -178,7 +184,7 @@ impl ClacState {
                 }
             };
 
-            match Self::execute(funcs, stack, token)? {
+            match Self::execute(funcs, stack, jit, token)? {
                 ExecRes::Executed => {
                     if !xs.is_empty() {
                         callstack.push(xs);
@@ -217,28 +223,30 @@ impl ClacState {
                     (rem, Some((name, Vec::new())))
                 }
                 ([Token::Semicolon, rem @ ..], Some((name, f))) => {
-                    let len = funcs.functions.len();
-
-                    let compiled = self.compile_function(&f).unwrap();
-
-                    println!("JIT compiled function {} -> {:?}", name, compiled);
-
-                    funcs = &mut self.funcmap;
-                    stack = &mut self.stack;
-
-                    // if we are re-defining a function, we should replace
                     match funcs.map.get(name) {
                         Some(idx) => {
-                            funcs.functions[*idx] = Function::Compiled(compiled);
+                            // replace already defined function
+                            funcs.functions[*idx] = Function::User(None, f);
                         }
                         None => {
-                            funcs.functions.push(Function::Compiled(compiled));
+                            // create new function
+                            let len = funcs.functions.len();
+                            funcs.functions.push(Function::User(None, f));
                             funcs.map.insert(name.to_string(), len);
                         }
                     };
 
-                    // resolve function names to indices
+                    // first, resolve function names to indices in FuncMap
                     resolve_funcmap(funcs);
+
+                    // Reset the JIT
+                    let old = std::mem::replace(&mut self.jit, JITState::new().unwrap());
+                    unsafe { old.module.free_memory() };
+
+                    self.declare_and_compile_all_functions().unwrap();
+
+                    funcs = &mut self.funcmap;
+                    stack = &mut self.stack;
 
                     (rem, None)
                 }
@@ -250,14 +258,19 @@ impl ClacState {
                     (rem, Some((nm, f)))
                 }
                 ([tok, rem @ ..], None) => {
-                    match Self::execute(funcs, stack, &tok.clone().token_to_instruction(funcs))? {
+                    match Self::execute(
+                        funcs,
+                        stack,
+                        &self.jit,
+                        &tok.clone().token_to_instruction(funcs),
+                    )? {
                         ExecRes::Executed => (rem, None),
                         ExecRes::Skip(n) => match rem.split_at_checked(n) {
                             Some((_, rem2)) => (rem2, None),
                             None => return Err(ExecError::InvalidSkip),
                         },
                         ExecRes::RecursiveCall(f) => {
-                            Self::exec_function(funcs, stack, vec![f])?;
+                            Self::exec_function(funcs, stack, &self.jit, vec![f])?;
                             (rem, None)
                         }
                     }

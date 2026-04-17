@@ -10,13 +10,13 @@ use types::*;
 // resolve functions so we don't need to do a costly hashmap lookup
 fn resolve_funcmap(funcs: &mut FuncMap) {
     for function in &mut funcs.functions {
-        if let Function::User(_, f) = function {
-            for token in f {
-                if let Instr::FunctionCall(FuncRef::Unresolved(name)) = token
-                    && let Some(resolved) = funcs.map.get(name)
-                {
-                    *token = Instr::FunctionCall(FuncRef::Resolved(*resolved));
-                }
+        let Function::User(_, f) = function;
+
+        for token in f {
+            if let Instr::FunctionCall(FuncRef::Unresolved(name)) = token
+                && let Some(resolved) = funcs.map.get(name)
+            {
+                *token = Instr::FunctionCall(FuncRef::Resolved(*resolved));
             }
         }
     }
@@ -73,13 +73,6 @@ impl ClacState {
                 };
 
                 match f {
-                    Function::Native(f) => {
-                        f(stack);
-                        Ok(ExecRes::Executed)
-                    }
-                    Function::ArithInstr(_) => unreachable!(
-                        "Tried to execute an ArithInstr as a function call, which should be impossible if this instruction was obtained from a token by token_to_instruction"
-                    ),
                     Function::User(fid, code) => match fid {
                         Some(compiled) => {
                             let asm = jit.get_function(*compiled);
@@ -132,30 +125,109 @@ impl ClacState {
                 let b = xpop()?;
                 let a = xpop()?;
                 stack.push(match it {
-                    Arith::Add => a + b,
-                    Arith::Sub => a - b,
-                    Arith::Mul => a * b,
-                    Arith::Div => a / b,
-                    Arith::Rem => a % b,
-                    Arith::Lt => {
+                    ArithOp::Add => a + b,
+                    ArithOp::Sub => a - b,
+                    ArithOp::Mul => a * b,
+                    ArithOp::Div => a / b,
+                    ArithOp::Rem => a % b,
+                    ArithOp::Lt => {
                         if a < b {
                             1
                         } else {
                             0
                         }
                     }
-                    Arith::Pow => builtins::pow(a, b).ok_or(ExecError::InvalidExponent)?,
+                    ArithOp::Pow => builtins::pow(a, b).ok_or(ExecError::InvalidExponent)?,
                 });
+                Ok(ExecRes::Executed)
+            }
+            Instr::Mem(memop) => {
+                match memop {
+                    MemOp::Read8 => {
+                        let addr = xpop()?;
+                        let val = (unsafe { *(addr as *const u8) }) as Value;
+                        stack.push(val);
+                    }
+
+                    MemOp::Write8 => {
+                        let value: u8 = xpop()?
+                            .try_into()
+                            .expect("trying to write8 on a value that doesn't fit in a byte");
+
+                        let addr = xpop()?;
+
+                        let ptr = addr as *mut u8;
+                        unsafe {
+                            *ptr = value;
+                        }
+                    }
+
+                    MemOp::ReadNative => {
+                        let addr = xpop()?;
+                        let val = (unsafe { *(addr as *const Value) }) as Value;
+                        stack.push(val);
+                    }
+
+                    MemOp::WriteNative => {
+                        let value: Value = xpop()?;
+                        let addr = xpop()?;
+
+                        let ptr = addr as *mut Value;
+                        unsafe {
+                            *ptr = value;
+                        }
+                    }
+
+                    MemOp::WidthNative => {
+                        stack.push(Value::BITS.into());
+                    }
+                };
+                Ok(ExecRes::Executed)
+            }
+            Instr::Syscall => {
+                let v6 = xpop()?;
+                let v5 = xpop()?;
+                let v4 = xpop()?;
+                let v3 = xpop()?;
+                let v2 = xpop()?;
+                let v1 = xpop()?;
+                let rax = xpop()?;
+
+                stack.push(unsafe { builtins::syscall(rax, v1, v2, v3, v4, v5, v6) });
+
                 Ok(ExecRes::Executed)
             }
             Instr::Pick => {
                 let conv: usize = xpop()?.try_into().map_err(|_| ExecError::InvalidPick)?;
-                // let got = stack
-                //     .get::<usize>(stack.len() - conv)
-                //     .ok_or(ExecError::InvalidPick)?;
-                let got: &mut Value = todo!();
+                let val = stack.rsp.wrapping_sub(conv);
 
-                stack.push(*got);
+                // TODO: undefined behavior for invalid picks?
+                stack.push(unsafe { *val });
+
+                Ok(ExecRes::Executed)
+            }
+            Instr::DropRange => {
+                let amount: usize = xpop()?
+                    .try_into()
+                    .map_err(|_| ExecError::InvalidDropRange)?;
+                let start: usize = xpop()?
+                    .try_into()
+                    .map_err(|_| ExecError::InvalidDropRange)?;
+
+                let true = amount <= start else {
+                    return Err(ExecError::InvalidDropRange);
+                };
+
+                let drop_start = stack.rsp.wrapping_sub(start);
+
+                let drop_end = drop_start.wrapping_add(amount);
+
+                debug_assert!(stack.rsp >= drop_end);
+                let keep_amount = unsafe { stack.rsp.offset_from_unsigned(drop_end) };
+
+                unsafe { std::ptr::copy(drop_end, drop_start, keep_amount) };
+
+                stack.rsp = stack.rsp.wrapping_sub(amount);
 
                 Ok(ExecRes::Executed)
             }

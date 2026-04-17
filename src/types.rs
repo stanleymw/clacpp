@@ -2,6 +2,7 @@ use core::{fmt, slice};
 use std::fmt::Debug;
 use std::io;
 
+use ahash::AHashMap;
 use cranelift::{
     codegen::Context,
     prelude::{AbiParam, FunctionBuilderContext, Signature, types::I64},
@@ -26,7 +27,7 @@ pub(crate) enum FuncRef {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum Arith {
+pub(crate) enum ArithOp {
     Add,
     Sub,
     Mul,
@@ -37,7 +38,14 @@ pub(crate) enum Arith {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum Mem {}
+pub(crate) enum MemOp {
+    Read8,
+    ReadNative,
+    Write8,
+    WriteNative,
+
+    WidthNative,
+}
 
 #[derive(Debug, Clone)]
 // Internal clac instruction
@@ -49,14 +57,16 @@ pub(crate) enum Instr {
     // side effects
     Quit,
     Print,
+    Syscall,
 
     // stack manipulation
     Drop,
     Swap,
     Rot,
+    DropRange,
 
-    Arith(Arith),
-    // Mem(Mem),
+    Arith(ArithOp),
+    Mem(MemOp),
 
     // Math Instructions
     If,
@@ -94,10 +104,12 @@ impl Token {
     pub(crate) fn token_to_instruction(self, functions: &FuncMap) -> Instr {
         match self {
             Token::Literal(n) => Instr::Literal(n),
+            Token::Identifier(name) if let Some(inst) = builtins::FUNCTIONS.get(name.as_str()) => {
+                inst.clone()
+            }
             Token::Identifier(name) => match functions.map.get(&name) {
-                Some(idx) => match &functions.functions[*idx] {
-                    Function::ArithInstr(inst) => Instr::Arith(inst.clone()),
-                    _ => Instr::FunctionCall(FuncRef::Resolved(*idx)),
+                Some(idx) => match functions.functions[*idx] {
+                    Function::User(_, _) => Instr::FunctionCall(FuncRef::Resolved(*idx)),
                 },
                 None => Instr::FunctionCall(FuncRef::Unresolved(name)),
             },
@@ -125,30 +137,15 @@ pub(crate) type JITFunction = unsafe extern "C" fn(*mut Value) -> *mut Value;
 
 #[derive(Debug, Clone)]
 pub(crate) enum Function {
-    Native(fn(&mut Stack)),
-
     User(Option<FuncId>, Code),
-
-    ArithInstr(Arith),
 }
 
 pub(crate) type CallStack<'a> = Vec<&'a [Instr]>;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct FuncMap {
     pub(crate) map: ahash::AHashMap<String, FunctionIndex>,
     pub(crate) functions: Vec<Function>,
-}
-
-fn name_func_pair_to_funcmap<const N: usize>(xs: [(&str, Function); N]) -> FuncMap {
-    FuncMap {
-        map: ahash::AHashMap::from_iter(
-            xs.iter()
-                .enumerate()
-                .map(|(i, (name, _))| (name.to_string(), i)),
-        ),
-        functions: Vec::from_iter(xs.into_iter().map(|(_, func)| func)),
-    }
 }
 
 // TODO: make a macro to do this
@@ -177,25 +174,6 @@ pub struct ClacState {
     pub(crate) stack: Stack,
     pub(crate) funcmap: FuncMap,
 }
-
-// extern "C" fn rpush(stack: *mut ValueStack, val: i64) {
-//     match unsafe { stack.as_mut() } {
-//         None => exit(67),
-//         Some(v) => {
-//             v.push(val);
-//         }
-//     }
-// }
-
-// extern "C" fn rpop(stack: *mut ValueStack) -> Value {
-//     match unsafe { stack.as_mut() } {
-//         None => exit(68),
-//         Some(v) => match v.pop() {
-//             None => exit(69),
-//             Some(n) => n,
-//         },
-//     }
-// }
 
 pub(crate) struct Stack {
     data: memmap2::MmapMut,
@@ -331,7 +309,7 @@ impl ClacState {
         Ok(ClacState {
             jit: JITState::new()?,
             stack: Stack::new(capacity)?,
-            funcmap: name_func_pair_to_funcmap(builtins::FUNCTIONS),
+            funcmap: FuncMap::default(),
         })
     }
 }
@@ -352,6 +330,9 @@ pub enum ExecError {
     InvalidSkip,
     #[error("Invalid Pick")]
     InvalidPick,
+    #[error("Invalid DropRange")]
+    InvalidDropRange,
+
     #[error("Bad function definition")]
     BadFunctionDefinition,
     #[error("Invalid exponent, must have non-negative exponent")]

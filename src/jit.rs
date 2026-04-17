@@ -3,7 +3,7 @@ use std::{
     mem::transmute_copy,
 };
 
-use crate::types::{self, Arith, CRANELIFT_VALUE, Instr, JITFunction, JITState};
+use crate::types::{self, ArithOp, CRANELIFT_VALUE, Instr, JITFunction, JITState};
 use ahash::AHashMap;
 use cranelift::{
     codegen::{
@@ -86,6 +86,8 @@ Optimization Ideas:
 - Lazy JIT: Queue up function definitions @ toplevel, and don't compile until the next function call.
 
 - BUG: : test 1 if ;
+
+- FFI
 
 */
 
@@ -239,16 +241,16 @@ fn compile_block(
                 let a = xpop(&mut tmp, bu);
 
                 tmp.push(match it {
-                    Arith::Add => bu.ins().iadd(a, b),
-                    Arith::Sub => bu.ins().isub(a, b),
-                    Arith::Mul => bu.ins().imul(a, b),
-                    Arith::Div => bu.ins().sdiv(a, b),
-                    Arith::Rem => bu.ins().srem(a, b),
-                    Arith::Lt => {
+                    ArithOp::Add => bu.ins().iadd(a, b),
+                    ArithOp::Sub => bu.ins().isub(a, b),
+                    ArithOp::Mul => bu.ins().imul(a, b),
+                    ArithOp::Div => bu.ins().sdiv(a, b),
+                    ArithOp::Rem => bu.ins().srem(a, b),
+                    ArithOp::Lt => {
                         let cmp = bu.ins().icmp(IntCC::SignedLessThan, a, b);
                         bu.ins().sextend(CRANELIFT_VALUE, cmp)
                     }
-                    Arith::Pow => {
+                    ArithOp::Pow => {
                         let call = bu.ins().call(refs.powfunc, &[a, b]);
                         bu.inst_results(call)[0]
                     }
@@ -363,6 +365,7 @@ fn compile_block(
                 let ret = bu.inst_results(ret)[0];
                 bu.def_var(stack, ret);
             }
+            _ => todo!(),
         }
     }
 

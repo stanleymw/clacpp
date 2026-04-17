@@ -320,6 +320,7 @@ pub fn repl(state: &mut ClacState, hide_stack: bool) -> Result<(), ReplError> {
         // FIXME: remove this
         if read == "int3" {
             unsafe { std::arch::asm!("int3") };
+            continue;
         }
 
         match state.execute_str(&read) {

@@ -3,10 +3,14 @@ use std::{
     mem::transmute_copy,
 };
 
-use crate::types::{self, Arith, CRANELIFT_VALUE, Function, Instr, JITFunction, JITState};
+use crate::types::{self, Arith, CRANELIFT_VALUE, Instr, JITFunction, JITState};
 use ahash::HashMapExt;
 use cranelift::{
-    codegen::ir::FuncRef,
+    codegen::{
+        control::ControlPlane,
+        cursor::{Cursor, CursorPosition, FuncCursor},
+        ir::{self, FuncRef, InstructionData, Opcode, ValueList},
+    },
     frontend::Switch,
     prelude::{
         AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, TrapCode, Value,
@@ -15,6 +19,7 @@ use cranelift::{
 };
 
 use types::FuncRef as ClacRef;
+use types::Function as ClacFunction;
 use types::Value as ClacValue;
 
 use cranelift_module::{FuncId, Module, ModuleError, ModuleResult};
@@ -80,6 +85,8 @@ Optimization Ideas:
 - Super well behaved clac functions, instead of passing values by stack, it passes it directly as function parameters (like through rdi, rsi, etc,)
 
 - Lazy JIT: Queue up function definitions @ toplevel, and don't compile until the next function call.
+
+- BUG: : test 1 if ;
 
 */
 
@@ -169,7 +176,7 @@ fn compile_block(
     total_len: usize,
     blockmap: &BlockMap,
     calleemap: &ahash::HashMap<FuncId, FuncRef>,
-    funcs: &[Function],
+    funcs: &[ClacFunction],
     stack: Variable,
     bu: &mut FunctionBuilder,
     refs: &ImportRefs,
@@ -292,7 +299,7 @@ fn compile_block(
                 if i > 0
                     && let Some(Instr::Literal(n)) = line.get(i - 1)
                 {
-                    let pop = xpop(&mut tmp, bu);
+                    let pop = xpop_no_value(&mut tmp, bu);
                     // TODO: assert popped == n
 
                     // no break here, we can use constant optimization
@@ -335,7 +342,7 @@ fn compile_block(
                     bu.ins().trap(TrapCode::unwrap_user(67));
                     return;
                 };
-                let Function::User(Some(funcid), _) = &funcs[*idx] else {
+                let ClacFunction::User(Some(funcid), _) = &funcs[*idx] else {
                     println!("Could not get func={func:?}");
                     bu.ins().trap(TrapCode::unwrap_user(67));
 
@@ -347,10 +354,10 @@ fn compile_block(
                 flush(&mut tmp, bu);
                 let final_stack = bu.use_var(stack);
 
-                if i == line.len() - 1 && is_last_block {
-                    bu.ins().return_call(*func, &[final_stack]);
-                    return;
-                }
+                // if i == line.len() - 1 && is_last_block {
+                //     bu.ins().return_call(*func, &[final_stack]);
+                //     return;
+                // }
 
                 let ret = bu.ins().call(*func, &[final_stack]);
                 // update stack
@@ -415,7 +422,7 @@ impl JITState {
     fn build_callee_map(
         &mut self,
         line: &[types::Instr],
-        funcs: &[Function],
+        funcs: &[ClacFunction],
     ) -> Result<ahash::HashMap<FuncId, FuncRef>, JITError> {
         let mut ret = ahash::HashMap::new();
 
@@ -425,7 +432,7 @@ impl JITState {
                     ClacRef::Resolved(idx) => {
                         let func = &funcs[*idx];
 
-                        if let Function::User(Some(fid), _) = func {
+                        if let ClacFunction::User(Some(fid), _) = func {
                             ret.insert(
                                 *fid,
                                 self.module.declare_func_in_func(*fid, &mut self.ctx.func),
@@ -481,7 +488,7 @@ impl JITState {
         &mut self,
         id: FuncId,
         line: &[types::Instr],
-        funcs: &[Function],
+        funcs: &[ClacFunction],
     ) -> Result<(), CompilerError> {
         self.module.clear_context(&mut self.ctx);
 
@@ -549,14 +556,137 @@ impl JITState {
             );
         }
 
-        // bu.seal_all_blocks(); // FIXME: investigate
+        println!("Before tailcall IR: {}", bu.func.display());
+
+        if let Some((_, ClacBlock(_, final_block))) = block_map.last_key_value() {
+            // debug_assert!(final_block)
+            optimize_tailcall(&mut bu.func, *final_block);
+        }
+
         bu.finalize();
 
-        // println!("{}", ctx.func.display());
+        println!("Unoptimized IR: {}", ctx.func.display());
+
+        ctx.set_disasm(true);
 
         module.define_function(id, ctx)?;
 
+        println!("Optimized IR: {}", ctx.func.display());
+
+        println!(
+            "disasm: {}",
+            ctx.compiled_code().unwrap().vcode.as_ref().unwrap()
+        );
+
         Ok(())
+    }
+}
+
+fn trivially_has_side_effects(opcode: cranelift::codegen::ir::Opcode) -> bool {
+    opcode.is_call()
+        || opcode.is_branch()
+        || opcode.is_terminator()
+        || opcode.is_return()
+        || opcode.can_trap()
+        || opcode.other_side_effects()
+        || opcode.can_store()
+    // || opcode.can_load()
+}
+
+// we need to make sure this return is the same as the resulting stack
+fn follow_jump_path_to_return_unless_side_effect_found(
+    cursor: &mut FuncCursor,
+) -> Option<(ir::Inst, ValueList)> {
+    while let Some(inst) = cursor.next_inst() {
+        let real = cursor.func.dfg.insts[inst];
+        // Ensure that the remaining functions do no side effects, and that the terminator == return || ALWAYS GOES TO the END BLOCK
+
+        match real {
+            InstructionData::Jump {
+                opcode: cranelift::codegen::ir::Opcode::Jump,
+                destination: bc,
+            } => {
+                let out = bc.block(&cursor.func.dfg.value_lists);
+                cursor.set_position(CursorPosition::Before(out));
+            }
+            InstructionData::MultiAry {
+                opcode: Opcode::Return,
+                args: elist,
+            } => {
+                return Some((inst, elist));
+            }
+            x if trivially_has_side_effects(x.opcode()) => return None,
+            _ => {}
+        }
+    }
+    unreachable!();
+}
+
+fn optimize_tailcall(
+    func: &mut cranelift::codegen::ir::Function,
+    final_block: cranelift::prelude::Block,
+) {
+    let mut cursor = FuncCursor::new(func);
+
+    while let Some(cur_block) = cursor.next_block() {
+        let mut to_tailcall = None;
+
+        while let Some(inst) = cursor.next_inst() {
+            let real = cursor.func.dfg.insts[inst];
+            if let InstructionData::Call {
+                opcode: _,
+                args,
+                func_ref,
+            } = real
+            {
+                to_tailcall = Some((inst, args, func_ref));
+                continue;
+            }
+        }
+
+        let Some((badcall, args, func_ref)) = to_tailcall else {
+            continue;
+        };
+
+        cursor.goto_inst(badcall);
+
+        let pos = cursor.position();
+        debug_assert_eq!(pos, CursorPosition::At(badcall));
+
+        let ret = follow_jump_path_to_return_unless_side_effect_found(&mut cursor);
+
+        cursor.set_position(pos);
+        debug_assert_eq!(cursor.position(), CursorPosition::At(badcall));
+
+        let Some((ret_inst, ret_args)) = ret else {
+            continue;
+        };
+
+        // result from our call
+        let resulting_stack = cursor.func.dfg.inst_results(badcall);
+        // returning to the function
+        if ret_args.as_slice(&cursor.func.dfg.value_lists) != resulting_stack {
+            continue;
+        }
+
+        println!("TAIL CALLING: {to_tailcall:?}");
+
+        let new = cursor.func.dfg.make_inst(InstructionData::Call {
+            opcode: cranelift::codegen::ir::Opcode::ReturnCall,
+            args,
+            func_ref,
+        });
+
+        // TODO: BUG IN CRANELIFT DOCUMENTAITON?? it seems to move the cursor forward
+        cursor.replace_inst(new);
+        let bug_workaround = cursor.prev_inst().unwrap();
+
+        debug_assert_eq!(bug_workaround, new);
+
+        while let Some(next) = cursor.next_inst() {
+            let removed = cursor.remove_inst_and_step_back();
+            debug_assert_eq!(next, removed);
+        }
     }
 }
 
@@ -575,7 +705,7 @@ impl types::ClacState {
         for (name, idx) in &self.funcmap.map {
             let loc = &self.funcmap.functions[*idx];
 
-            if let Function::User(Some(id), _) = loc {
+            if let ClacFunction::User(Some(id), _) = loc {
                 println!(
                     "Function {name} = {loc:?} (JIT @ {:?})",
                     self.jit.get_function(*id)
@@ -588,7 +718,7 @@ impl types::ClacState {
 
     pub(crate) fn create_and_set_wrappers(&mut self) -> ModuleResult<()> {
         for function in &mut self.funcmap.functions {
-            if let Function::User(funcid, _) = function {
+            if let ClacFunction::User(funcid, _) = function {
                 *funcid = Some(self.jit.create_wrapper(funcid.unwrap())?);
                 println!("Generated wrapper: {funcid:?}");
             }
@@ -601,7 +731,7 @@ impl types::ClacState {
         // FIXME: remove clone
         let clone = &self.funcmap.functions.clone();
         for function in &mut self.funcmap.functions {
-            if let Function::User(fid, code) = function {
+            if let ClacFunction::User(fid, code) = function {
                 match self.jit.compile_function((*fid).unwrap(), code, clone) {
                     Ok(()) => {
                         println!("Successfully compiled {fid:?} (code = {code:?})");
@@ -618,7 +748,7 @@ impl types::ClacState {
         let sig = self.jit.generate_signature(CallConv::Tail);
 
         for function in &mut self.funcmap.functions {
-            if let Function::User(funcid, code) = function {
+            if let ClacFunction::User(funcid, code) = function {
                 *funcid = Some(self.jit.module.declare_anonymous_function(&sig)?);
                 println!("Function {funcid:?} has code = {code:?}");
             }

@@ -3,7 +3,7 @@ use std::{
     mem::transmute_copy,
 };
 
-use crate::types::{self, ArithOp, CRANELIFT_VALUE, Instr, JITFunction, JITState};
+use crate::types::{self, ArithOp, CRANELIFT_VALUE, Instr, JITFunction, JITState, MemOp};
 use ahash::AHashMap;
 use cranelift::{
     codegen::{
@@ -12,8 +12,10 @@ use cranelift::{
     },
     frontend::Switch,
     prelude::{
-        AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, TrapCode, Value,
-        Variable, isa::CallConv, types::I64,
+        AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, TrapCode, Type, Value,
+        Variable,
+        isa::{CallConv, TargetIsa},
+        types::I64,
     },
 };
 
@@ -174,6 +176,7 @@ fn make_blockmap<'a>(
 
 fn compile_block(
     (head, ClacBlock(line, block)): (usize, &ClacBlock),
+    isa: &dyn TargetIsa,
     total_len: usize,
     blockmap: &BlockMap,
     calleemap: &ahash::HashMap<FuncId, FuncRef>,
@@ -365,7 +368,97 @@ fn compile_block(
                 let ret = bu.inst_results(ret)[0];
                 bu.def_var(stack, ret);
             }
-            _ => todo!(),
+            Instr::Mem(memop) => {
+                match memop {
+                    MemOp::Read8 => {
+                        let addr = xpop(&mut tmp, bu);
+
+                        tmp.push(
+                            bu.ins()
+                                .load(Type::int(8).unwrap(), MemFlags::new(), addr, 0),
+                        );
+                    }
+
+                    MemOp::Write8 => {
+                        let value /*: u8*/ = xpop(&mut tmp, bu);
+                        let addr = xpop(&mut tmp, bu);
+
+                        // TODO: this will DISCARD BITS
+                        bu.ins().istore8(MemFlags::new(), value, addr, 0);
+                    }
+
+                    MemOp::ReadNative => {
+                        let addr = xpop(&mut tmp, bu);
+                        tmp.push(bu.ins().load(CRANELIFT_VALUE, MemFlags::new(), addr, 0));
+                    }
+
+                    MemOp::WriteNative => {
+                        let value = xpop(&mut tmp, bu);
+                        let addr = xpop(&mut tmp, bu);
+
+                        // TODO: this will DISCARD BITS
+                        bu.ins().store(MemFlags::new(), value, addr, 0);
+                    }
+
+                    MemOp::WidthNative => {
+                        let amt: i64 = ClacValue::BITS.into();
+                        tmp.push(bu.ins().iconst(CRANELIFT_VALUE, amt));
+                    }
+                };
+            }
+            // TODO: optimize by special casing on compile time known ranges
+            Instr::DropRange => {
+                let amount = xpop(&mut tmp, bu);
+                let start = xpop(&mut tmp, bu);
+
+                let value_sz: i64 = std::mem::size_of::<ClacValue>().try_into().unwrap();
+
+                let start_strided = bu.ins().imul_imm(start, value_sz);
+                let amount_strided = bu.ins().imul_imm(amount, value_sz);
+
+                // TODO: undefined behavior (?)
+                // let true = amount <= start else {
+                //     return Err(ExecError::InvalidDropRange);
+                // };
+
+                // TODO: maybe can remove flush?
+                flush(&mut tmp, bu);
+
+                let rsp = bu.use_var(stack);
+
+                let drop_start = bu.ins().isub(rsp, start_strided);
+                let drop_end = bu.ins().iadd(drop_start, amount_strided);
+
+                // TODO: undefined behavior
+                // debug_assert!(stack.rsp >= drop_end);
+
+                let keep_amount = bu.ins().isub(start, amount);
+                let keep_amount_strided = bu.ins().imul_imm(keep_amount, value_sz);
+                // TODO: assert that keep_amount >= 0
+
+                bu.call_memmove(
+                    isa.frontend_config(),
+                    drop_start,
+                    drop_end,
+                    keep_amount_strided,
+                );
+
+                let new_rsp = bu.ins().isub(rsp, amount_strided);
+                bu.def_var(stack, new_rsp);
+            }
+            Instr::Syscall => {
+                let v6 = xpop(&mut tmp, bu);
+                let v5 = xpop(&mut tmp, bu);
+                let v4 = xpop(&mut tmp, bu);
+                let v3 = xpop(&mut tmp, bu);
+                let v2 = xpop(&mut tmp, bu);
+                let v1 = xpop(&mut tmp, bu);
+                let rax = xpop(&mut tmp, bu);
+
+                let sysc = bu.ins().call(refs.syscall, &[rax, v1, v2, v3, v4, v5, v6]);
+
+                tmp.push(bu.inst_results(sysc)[0]);
+            }
         }
     }
 
@@ -391,6 +484,7 @@ struct ImportRefs {
     quitfunc: FuncRef,
     errorfunc: FuncRef,
     powfunc: FuncRef,
+    syscall: FuncRef,
 }
 
 #[derive(Debug, Error)]
@@ -509,6 +603,7 @@ impl JITState {
                     quitfunc,
                     errorfunc,
                     powfunc,
+                    syscall,
                 },
         } = self;
 
@@ -519,6 +614,7 @@ impl JITState {
             quitfunc: module.declare_func_in_func(*quitfunc, &mut ctx.func),
             errorfunc: module.declare_func_in_func(*errorfunc, &mut ctx.func),
             powfunc: module.declare_func_in_func(*powfunc, &mut ctx.func),
+            syscall: module.declare_func_in_func(*syscall, &mut ctx.func),
         };
 
         let breaks = get_block_breaks(line)?;
@@ -548,6 +644,7 @@ impl JITState {
         for (i, block) in &block_map {
             compile_block(
                 (*i, block),
+                module.isa(),
                 line.len(),
                 &block_map,
                 &callees,

@@ -223,7 +223,12 @@ impl ClacState {
                 let drop_end = drop_start.wrapping_add(amount);
 
                 debug_assert!(stack.rsp >= drop_end);
-                let keep_amount = unsafe { stack.rsp.offset_from_unsigned(drop_end) };
+
+                let keep_amount = start - amount;
+                debug_assert_eq!(
+                    unsafe { stack.rsp.offset_from_unsigned(drop_end) },
+                    keep_amount
+                );
 
                 unsafe { std::ptr::copy(drop_end, drop_start, keep_amount) };
 

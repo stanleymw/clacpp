@@ -153,6 +153,7 @@ pub(crate) struct Imports {
     pub(crate) printfunc: FuncId,
     pub(crate) quitfunc: FuncId,
     pub(crate) powfunc: FuncId,
+    pub(crate) syscall: FuncId,
 
     pub(crate) errorfunc: FuncId,
 }
@@ -243,6 +244,7 @@ impl JITState {
         builder.symbol("__rquit__", jit_builtins::quit as *const u8);
         builder.symbol("__rerr__", jit_builtins::error as *const u8);
         builder.symbol("__rpow__", jit_builtins::pow as *const u8);
+        builder.symbol("__syscall__", builtins::syscall as *const u8);
 
         let mut module = cranelift_jit::JITModule::new(builder);
 
@@ -254,6 +256,18 @@ impl JITState {
             &Signature {
                 params: vec![valparam],
                 returns: vec![],
+                call_conv: module.isa().default_call_conv(),
+            },
+        )?;
+
+        let syscallfunc = module.declare_function(
+            "__syscall__",
+            cranelift_module::Linkage::Import,
+            &Signature {
+                params: vec![
+                    valparam, valparam, valparam, valparam, valparam, valparam, valparam,
+                ],
+                returns: vec![valparam],
                 call_conv: module.isa().default_call_conv(),
             },
         )?;
@@ -299,6 +313,7 @@ impl JITState {
                 quitfunc: quitfunc,
                 errorfunc: errorfunc,
                 powfunc: powfunc,
+                syscall: syscallfunc,
             },
         })
     }

@@ -18,6 +18,7 @@ cranelift = "0.130.1"
 cranelift-jit = { version = "0.130.1", features = ["selinux-fix"] }
 cranelift-module = "0.130.1"
 cranelift-native = "0.130.1"
+cranelift-object = "0.130.1"
 memmap2 = "0.9.10"
 rustyline = "18.0.0"
 thiserror = "2.0.18"

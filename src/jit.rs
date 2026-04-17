@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    io::BufWriter,
     mem::transmute_copy,
 };
 
@@ -7,21 +8,25 @@ use crate::types::{self, Arith, CRANELIFT_VALUE, Instr, JITFunction, JITState};
 use ahash::AHashMap;
 use cranelift::{
     codegen::{
+        Context,
         cursor::{Cursor, CursorPosition, FuncCursor},
         ir::{BlockArg, FuncRef, InstructionData, Opcode},
     },
     frontend::Switch,
     prelude::{
         AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, TrapCode, Value,
-        Variable, isa::CallConv, types::I64,
+        Variable,
+        isa::{Builder, CallConv},
+        types::I64,
     },
 };
 
+use cranelift_object::{ObjectBuilder, ObjectModule};
 use types::FuncRef as ClacRef;
 use types::Function as ClacFunction;
 use types::Value as ClacValue;
 
-use cranelift_module::{FuncId, Module, ModuleError, ModuleResult};
+use cranelift_module::{FuncId, Linkage, Module, ModuleError, ModuleResult, default_libcall_names};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -567,6 +572,28 @@ impl JITState {
         println!("Unoptimized IR: {}", ctx.func.display());
 
         ctx.set_disasm(true);
+
+        let builder = cranelift::prelude::settings::builder();
+        let flags = cranelift::prelude::settings::Flags::new(builder);
+
+        let objbuild = ObjectBuilder::new(
+            Builder::from_target_isa(module.isa())
+                .finish(flags)
+                .unwrap(),
+            "objbuild",
+            default_libcall_names(),
+        )?;
+
+        let mut objmod = ObjectModule::new(objbuild);
+        let oid = objmod.declare_function("test", Linkage::Export, &ctx.func.signature)?;
+        let () = objmod.define_function(oid, ctx).unwrap();
+
+        let out = objmod.finish();
+
+        let created = std::fs::File::create("compiled.o").unwrap();
+        let bufw = BufWriter::new(created);
+
+        out.object.write_stream(bufw).unwrap();
 
         module.define_function(id, ctx)?;
 

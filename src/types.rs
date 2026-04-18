@@ -327,6 +327,18 @@ impl JITState {
     }
 }
 
+#[derive(Debug, Error)]
+pub enum ReplError {
+    #[error("Execution Error: {0}")]
+    ExecError(#[from] ExecError),
+
+    #[error("Readline Error: {0}")]
+    LineError(#[from] rustyline::error::ReadlineError),
+
+    #[error("Init error: {0}")]
+    InitError(#[from] InitError),
+}
+
 impl ClacState {
     pub fn new(capacity: usize) -> Result<Self, InitError> {
         Ok(ClacState {
@@ -335,6 +347,43 @@ impl ClacState {
             undefined_functions: Vec::new(),
             funcmap: FuncMap::default(),
         })
+    }
+
+    /// Launch an interactive REPL on the provided ClacState.
+    pub fn repl(&mut self, hide_stack: bool) -> Result<(), ReplError> {
+        println!("clac++ {} by stanleymw", env!("CARGO_PKG_VERSION"),);
+
+        let mut editor = rustyline::DefaultEditor::new()?;
+
+        loop {
+            let read = match editor.readline("clac++> ") {
+                Err(rustyline::error::ReadlineError::Eof)
+                | Err(rustyline::error::ReadlineError::Interrupted) => {
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+                Ok(res) => {
+                    editor.add_history_entry(&res)?;
+                    res
+                }
+            };
+
+            // FIXME: remove this
+            if read == "int3" {
+                unsafe { std::arch::asm!("int3") };
+                continue;
+            }
+
+            match self.execute_str(&read) {
+                Err(ExecError::Quit) => return Ok(()),
+                Err(x) => return Err(x.into()),
+                Ok(()) => {}
+            };
+
+            if !hide_stack {
+                println!("{:?}", self.stack)
+            }
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use clac_lang::{ReplError, types::*};
+use clac_lang::types::*;
 use clap::Parser;
 use std::io::Read;
 
@@ -36,5 +36,5 @@ fn main() -> Result<(), ReplError> {
         };
     }
 
-    clac_lang::repl(&mut state, args.hide_stack)
+    state.repl(args.hide_stack)
 }

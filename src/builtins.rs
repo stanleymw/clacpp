@@ -9,7 +9,7 @@ unsafe extern "C" {
 }
 
 pub(crate) fn pow(x: Value, y: Value) -> Option<Value> {
-    Some(x.pow(y.try_into().ok()?))
+    Some(x.wrapping_pow(y.try_into().ok()?))
 }
 
 /*

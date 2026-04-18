@@ -10,7 +10,7 @@ pub(crate) extern "C" fn pow(x: types::Value, y: types::Value) -> types::Value {
     match builtins::pow(x, y) {
         Some(res) => res,
         None => {
-            eprintln!("Must pow with a non-negative exponent!");
+            eprintln!("BAD POW");
             std::process::exit(1);
         }
     }

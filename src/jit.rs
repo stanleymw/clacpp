@@ -373,10 +373,7 @@ fn compile_block(
                     MemOp::Read8 => {
                         let addr = xpop(&mut tmp, bu);
 
-                        tmp.push(
-                            bu.ins()
-                                .load(Type::int(8).unwrap(), MemFlags::new(), addr, 0),
-                        );
+                        tmp.push(bu.ins().uload8(CRANELIFT_VALUE, MemFlags::new(), addr, 0));
                     }
 
                     MemOp::Write8 => {
@@ -396,7 +393,6 @@ fn compile_block(
                         let value = xpop(&mut tmp, bu);
                         let addr = xpop(&mut tmp, bu);
 
-                        // TODO: this will DISCARD BITS
                         bu.ins().store(MemFlags::new(), value, addr, 0);
                     }
 
@@ -659,7 +655,7 @@ impl JITState {
 
         if let Some((_, ClacBlock(_, final_block))) = block_map.last_key_value() {
             // debug_assert!(final_block)
-            optimize_tailcall(&mut bu.func, *final_block);
+            // optimize_tailcall(&mut bu.func, *final_block);
         }
 
         bu.finalize();

@@ -12,7 +12,7 @@ use cranelift::{
     },
     frontend::Switch,
     prelude::{
-        AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, TrapCode, Type, Value,
+        AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, TrapCode, Value,
         Variable,
         isa::{CallConv, TargetIsa},
         types::I64,
@@ -72,34 +72,6 @@ fn emit_pick(bu: &mut FunctionBuilder, stack: Variable, offset: Value) {
     let loaded = bu.ins().load(CRANELIFT_VALUE, ALIGNED, target_pos, 0);
     emit_push(bu, stack, loaded);
 }
-
-/*
-
-Optimization Ideas:
-
-- Simulate as much of stack as possible in compile time -> have a constant folding step first (to improve our analysis).
-    - 1 1 + pick => 2 pick
-    - Compile Time Pick tracking (no flush)
-
-- Reduce flushes with better analysis
-
-- Super well behaved clac functions, instead of passing values by stack, it passes it directly as function parameters (like through rdi, rsi, etc,)
-
-- Lazy JIT: Queue up function definitions @ toplevel, and don't compile until the next function call.
-
-- BUG:
-    : test 1 if ;
-
-- FFI
-
-- BUG: (due to tail call)
-    clac++> : test 67 ;
-    []
-    clac++> : t2 if UNDEFINED 1 skip test ;
-    []
-    clac++> 0 t2
-
-*/
 
 #[cfg(debug_assertions)]
 fn debug_simulate_breaks(func: &[types::Instr]) {}

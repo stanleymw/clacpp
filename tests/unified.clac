@@ -1,0 +1,28 @@
+: if_test if if if if 1 2 3 ;
+
+: first 10 print second ;
+: second 20 print first ;
+
+: put swap 1 pick 1 swap < 5 * skip drop swap drop 79 skip 1 - swap rot 1 pick 1 pick 0 < 0 rot < + 5 * skip drop put 0 57 skip 1 pick 1 pick -1 < -1 rot < + 5 * skip drop put -1 39 skip 1 pick 2 % 1 pick 0 < 0 rot < + 11 * skip 2 / rot 1 + rot put 2 * 13 skip 1 - 2 / rot 1 + rot put 2 * 1 + ;
+
+: t1 1 drop 2 drop 3 drop 4 drop 5 drop ;
+
+: t2 1 2 3 rot rot rot ;
+
+: test 0 skip ;
+
+: COMMENT  this should just be sub rsp, 3*8  ; 
+: drop_range_1 1 2 3 4 5     3 3 drop_range ;
+
+: COMMENT  this should be sub rsp (10 - # of things on shim)*8,  and then SHIM.push(4 and 5) ;
+: COMMENT x x x x x 1 2 3 4 5 ;
+
+: drop_range_2 1 2 3 4 5     10 8 drop_range ;
+
+: tc_helper 67 ;
+
+: tc_1 if PURPOSELY_UNDEFINED 1 skip tc_helper ;
+
+: tc_1 0 if PURPOSELY_UNDEFINED 1 skip tc_helper ;
+
+: BAD_IF if ;

@@ -1,0 +1,2 @@
+: put swap 1 pick 1 swap < 5 * skip drop swap drop 79 skip 1 - swap rot 1 pick 1 pick 0 < 0 rot < + 5 * skip drop put 0 57 skip 1 pick 1 pick -1 < -1 rot < + 5 * skip drop put -1 39 skip 1 pick 2 % 1 pick 0 < 0 rot < + 11 * skip 2 / rot 1 + rot put 2 * 13 skip 1 - 2 / rot 1 + rot put 2 * 1 + ;
+

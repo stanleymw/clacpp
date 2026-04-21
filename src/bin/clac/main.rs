@@ -1,4 +1,4 @@
-use clac_lang::{ReplError, types::*};
+use clac_lang::types::*;
 use clap::Parser;
 use std::io::Read;
 
@@ -6,8 +6,8 @@ use std::io::Read;
 struct Args {
     file: Option<std::path::PathBuf>,
 
-    /// The number of elements that will have space pre-allocate for on the Clac Stack
-    #[arg(short, long, default_value_t = 1_000_000)]
+    /// The number of elements that the Clac Stack can store.
+    #[arg(short, long, default_value_t = 1_000_000_000)]
     stack: usize,
 
     /// Hide the Clac Stack in the Repl
@@ -21,8 +21,7 @@ struct Args {
 fn main() -> Result<(), ReplError> {
     let args = Args::parse();
 
-    let mut state: ClacState = Default::default();
-    state.stack.reserve(args.stack);
+    let mut state: ClacState = ClacState::new(args.stack * 8)?;
 
     if let Some(f) = args.file {
         let mut file = std::fs::File::open(f).expect("Could not open file");
@@ -37,5 +36,5 @@ fn main() -> Result<(), ReplError> {
         };
     }
 
-    clac_lang::repl(&mut state, args.hide_stack)
+    state.repl(args.hide_stack)
 }

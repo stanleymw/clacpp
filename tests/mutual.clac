@@ -1,0 +1,2 @@
+: first 10 print second ;
+: second 20 print first ;

@@ -38,4 +38,4 @@
 : func-game_loop-233 2 pick 2 pick func-print_game-214 0 print 0 print 0 print 2 pick 2 pick func-compute_next_data_low-122 3 pick 3 pick func-compute_next_data_high-150 1 pick 3 pick rot drop rot drop rot drop rot drop func-game_loop-233 ;
 
 : comment Start Main ;
-4 50987008 func-game_loop-233
+: __main 4 50987008 func-game_loop-233 ;

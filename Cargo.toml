@@ -1,6 +1,6 @@
 [package]
 name = "clac-lang"
-version = "0.1.1"
+version = "0.2.0-beta"
 edition = "2024"
 exclude = [
     "samples/",
@@ -14,5 +14,13 @@ name = "clac"
 [dependencies]
 ahash = "0.8.12"
 clap = { version = "4.6.0", features = ["derive"] }
+cranelift = "0.130.1"
+cranelift-jit = { version = "0.130.1", features = ["selinux-fix"] }
+cranelift-module = "0.130.1"
+cranelift-native = "0.130.1"
+memmap2 = "0.9.10"
 rustyline = "18.0.0"
 thiserror = "2.0.18"
+
+[features]
+debug = []

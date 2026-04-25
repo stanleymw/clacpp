@@ -3,8 +3,6 @@ mod jit;
 mod jit_builtins;
 pub mod types;
 
-use rustyline::error::ReadlineError;
-use thiserror::Error;
 use types::*;
 
 // resolve functions so we don't need to do a costly hashmap lookup

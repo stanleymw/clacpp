@@ -1,6 +1,6 @@
 [package]
 name = "clac-lang"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 edition = "2024"
 exclude = [
     "samples/",
@@ -20,6 +20,7 @@ cranelift-module = "0.130.1"
 cranelift-native = "0.130.1"
 memmap2 = "0.9.10"
 rustyline = "18.0.0"
+sc = "0.2.7"
 thiserror = "2.0.18"
 
 [features]

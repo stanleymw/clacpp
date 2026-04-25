@@ -118,7 +118,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "clac-lang"
-version = "0.2.0-beta"
+version = "0.2.1-beta"
 dependencies = [
  "ahash",
  "clap",
@@ -128,6 +128,7 @@ dependencies = [
  "cranelift-native",
  "memmap2 0.9.10",
  "rustyline",
+ "sc",
  "thiserror",
 ]
 
@@ -641,6 +642,12 @@ dependencies = [
  "utf8parse",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "sc"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "010e18bd3bfd1d45a7e666b236c78720df0d9a7698ebaa9c1c559961eb60a38b"
 
 [[package]]
 name = "serde"

@@ -1,6 +1,6 @@
 [package]
 name = "clac-lang"
-version = "0.2.1-beta"
+version = "0.3.0-alpha"
 edition = "2024"
 exclude = [
     "samples/",

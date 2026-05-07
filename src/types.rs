@@ -233,7 +233,9 @@ pub enum InitError {
     IoError(#[from] io::Error),
 }
 
-fn declare_imports(module: &mut impl Module) -> Result<Imports, cranelift_module::ModuleError> {
+pub(crate) fn declare_imports(
+    module: &mut impl Module,
+) -> Result<Imports, cranelift_module::ModuleError> {
     let valparam = AbiParam::new(CRANELIFT_VALUE);
 
     // TODO: make better

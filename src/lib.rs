@@ -4,12 +4,14 @@ pub mod types;
 
 use ahash::{HashMap, HashMapExt};
 
-use cranelift::prelude::isa::OwnedTargetIsa;
+use cranelift::prelude::{FunctionBuilderContext, isa::OwnedTargetIsa};
 use cranelift_jit::JITModule;
 use cranelift_module::{Module, ModuleError};
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 use thiserror::Error;
 use types::*;
+
+use crate::jit::jit::CompilerError;
 
 fn parse(token: &str) -> Token {
     use Token::*;
@@ -372,7 +374,7 @@ impl ClacState {
 }
 
 #[derive(Debug, Error)]
-pub enum CompileError {
+pub enum AOTCompileError {
     #[error("Bad Function Definition")]
     BadFunctionDefinition,
 
@@ -381,12 +383,16 @@ pub enum CompileError {
 
     #[error("Cranelift module error: {0}")]
     CraneliftModuleError(#[from] ModuleError),
+
+    #[error("Compile error: {0}")]
+    CompileError(#[from] CompilerError),
 }
 
-fn extract_functions(mut line: &[Token]) -> Result<HashMap<&str, Code>, CompileError> {
+fn extract_functions(mut line: &[Token]) -> Result<HashMap<&str, Code>, AOTCompileError> {
     let mut cur_func: Option<(&str, Code)> = None;
     let mut res: HashMap<&str, Code> = HashMap::new();
 
+    // we need to ensure that it is all functions: NO TOP LEVEL
     loop {
         (line, cur_func) = match (line, cur_func) {
             ([Token::Colon, Token::Identifier(name), rem @ ..], None) => {
@@ -400,14 +406,14 @@ fn extract_functions(mut line: &[Token]) -> Result<HashMap<&str, Code>, CompileE
                 (rem, None)
             }
             ([Token::Colon | Token::Semicolon, ..], _) => {
-                return Err(CompileError::BadFunctionDefinition);
+                return Err(AOTCompileError::BadFunctionDefinition);
             }
             ([tok, rem @ ..], Some((nm, mut f))) => {
                 f.push(tok.clone().to_instruction());
                 (rem, Some((nm, f)))
             }
-            ([_, ..], None) => return Err(CompileError::TopLevelDisallowed),
-            ([], Some(_)) => return Err(CompileError::BadFunctionDefinition),
+            ([_, ..], None) => return Err(AOTCompileError::TopLevelDisallowed),
+            ([], Some(_)) => return Err(AOTCompileError::BadFunctionDefinition),
             ([], None) => return Ok(res),
         };
     }
@@ -416,22 +422,56 @@ fn extract_functions(mut line: &[Token]) -> Result<HashMap<&str, Code>, CompileE
 pub fn compile_tokens(
     line: &[Token],
     isa: OwnedTargetIsa,
-    object_name: String,
-) -> Result<ObjectProduct, CompileError> {
-    // we need to ensure that it is all functions
-    let functions = extract_functions(line)?;
-
+    object_name: &str,
+) -> Result<ObjectProduct, AOTCompileError> {
     let module = ObjectBuilder::new(isa, object_name, cranelift_module::default_libcall_names())?;
-    let module = ObjectModule::new(module);
+    let mut module = ObjectModule::new(module);
 
-    Ok(module.finish())
+    let declared = declare_imports(&mut module)?;
+    let ctx = module.make_context();
+
+    let mut compiler = Compiler {
+        module,
+        fbctx: FunctionBuilderContext::new(),
+        ctx,
+        imports: declared,
+    };
+
+    let externc = compiler.generate_signature(compiler.module.isa().default_call_conv());
+    let tail = compiler.generate_signature(cranelift::prelude::isa::CallConv::Tail);
+
+    let functions: FuncMap = FuncMap(
+        extract_functions(line)?
+            .into_iter()
+            .map(|(name, code)| {
+                let id = compiler.module.declare_anonymous_function(&tail).unwrap();
+                let wrapper_id = compiler
+                    .module
+                    .declare_function(name, cranelift_module::Linkage::Export, &externc)
+                    .unwrap();
+
+                (
+                    name.to_string(),
+                    Function {
+                        code,
+                        id,
+                        wrapper_id,
+                    },
+                )
+            })
+            .collect(),
+    );
+
+    compiler.compile_functions_and_wrappers(&functions)?;
+
+    Ok(compiler.module.finish())
 }
 
 pub fn compile_str(
     line: &str,
     isa: OwnedTargetIsa,
-    object_name: String,
-) -> Result<ObjectProduct, CompileError> {
+    object_name: &str,
+) -> Result<ObjectProduct, AOTCompileError> {
     let parsed: Vec<Token> = line.split_whitespace().map(parse).collect();
 
     compile_tokens(&parsed, isa, object_name)

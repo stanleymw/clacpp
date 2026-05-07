@@ -30,7 +30,7 @@ use cranelift_module::{FuncId, Module, ModuleError, ModuleResult};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub(crate) enum CompilerError {
+pub enum CompilerError {
     #[error("Module (cranelift) Error: {0}")]
     ModuleError(#[from] ModuleError),
 

@@ -1,30 +1,15 @@
 mod builtins;
 mod jit;
-mod jit_builtins;
 pub mod types;
 
 use ahash::{HashMap, HashMapExt};
 
 use cranelift::prelude::isa::OwnedTargetIsa;
-use cranelift_module::ModuleError;
+use cranelift_jit::JITModule;
+use cranelift_module::{Module, ModuleError};
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 use thiserror::Error;
 use types::*;
-
-// resolve functions so we don't need to do a costly hashmap lookup
-fn resolve_funcmap(funcs: &mut FuncMap) {
-    for function in &mut funcs.functions {
-        let Function::User(_, f) = function;
-
-        for token in f {
-            if let Instr::FunctionCall(FuncRef::Unresolved(name)) = token
-                && let Some(resolved) = funcs.map.get(name)
-            {
-                *token = Instr::FunctionCall(FuncRef::Resolved(*resolved));
-            }
-        }
-    }
-}
 
 fn parse(token: &str) -> Token {
     use Token::*;
@@ -56,7 +41,7 @@ impl ClacState {
     fn execute<'cs>(
         functions: &'cs FuncMap,
         stack: &mut Stack,
-        jit: &JITState,
+        jit: &Compiler<JITModule>,
         token: &Instr,
     ) -> Result<ExecRes<'cs>, ExecError> {
         let mut xpop = || stack.pop().ok_or(ExecError::MissingArguments);
@@ -68,27 +53,16 @@ impl ClacState {
             }
             Instr::Quit => Err(ExecError::Quit),
             Instr::FunctionCall(state) => {
-                let f = match state {
-                    FuncRef::Resolved(x) => &functions.functions[*x],
-                    FuncRef::Unresolved(name) => match functions.map.get(name) {
-                        Some(_) => unreachable!("Should have already been resolved"), // NOTE: we SHOULD be executing top level, because otherwise this token should have already been resolved.
-                        None => return Err(ExecError::UnknownFunction(name.to_string())),
-                    },
+                let Some(f) = functions.lookup(state) else {
+                    return Err(ExecError::UnknownFunction(state.0.to_string()));
                 };
 
-                match f {
-                    Function::User(fid, code) => match fid {
-                        Some(compiled) => {
-                            let asm = jit.get_function(*compiled);
+                let asm = jit.get_function(f.id);
 
-                            let new_rsp = unsafe { asm(stack.rsp) };
-                            stack.rsp = new_rsp;
+                let new_rsp = unsafe { asm(stack.rsp) };
+                stack.rsp = new_rsp;
 
-                            Ok(ExecRes::Executed)
-                        }
-                        None => Ok(ExecRes::RecursiveCall(code)),
-                    },
-                }
+                Ok(ExecRes::Executed)
             }
 
             Instr::Print => {
@@ -247,7 +221,7 @@ impl ClacState {
     fn exec_function<'cs>(
         funcs: &'cs FuncMap,
         stack: &mut Stack,
-        jit: &JITState,
+        jit: &Compiler<JITModule>,
         mut callstack: CallStack<'cs>,
     ) -> Result<(), ExecError> {
         while let Some(line) = callstack.pop() {
@@ -291,31 +265,40 @@ impl ClacState {
         Ok(())
     }
 
-    fn flush_queue_and_recompile(&mut self) {
-        for (name, f) in self.undefined_functions.drain(..) {
-            match self.funcmap.map.get(&name) {
-                Some(idx) => {
-                    // replace already defined function
-                    self.funcmap.functions[*idx] = Function::User(None, f);
-                }
-                None => {
-                    // create new function
-                    let len = self.funcmap.functions.len();
-                    self.funcmap.functions.push(Function::User(None, f));
-                    self.funcmap.map.insert(name.to_string(), len);
-                }
-            };
-        }
+    fn reset_module_and_recompile_all(&mut self) {
+        // Reset the JIT
+        let old = std::mem::replace(&mut self.jit, Compiler::new().unwrap());
+        unsafe { old.module.free_memory() };
 
-        resolve_funcmap(&mut self.funcmap);
+        let externc = self
+            .jit
+            .generate_signature(self.jit.module.isa().default_call_conv());
+
+        let tail = self
+            .jit
+            .generate_signature(cranelift::prelude::isa::CallConv::Tail);
+
+        for (name, f) in self.undefined_functions.drain(..) {
+            self.funcmap.0.insert(
+                name,
+                Function {
+                    code: f,
+                    id: self.jit.module.declare_anonymous_function(&tail).unwrap(),
+                    wrapper_id: self
+                        .jit
+                        .module
+                        .declare_anonymous_function(&externc)
+                        .unwrap(),
+                },
+            );
+        }
 
         assert!(self.undefined_functions.is_empty());
 
-        // Reset the JIT
-        let old = std::mem::replace(&mut self.jit, JITState::new().unwrap());
-        unsafe { old.module.free_memory() };
-
-        self.declare_and_compile_all_functions().unwrap();
+        self.jit
+            .compile_functions_and_wrappers(&self.funcmap)
+            .unwrap();
+        self.jit.module.finalize_definitions().unwrap();
     }
 
     /// Execute a slice of [`Token`]s representing a line of Clac++ code.
@@ -341,25 +324,28 @@ impl ClacState {
                     return Err(ExecError::BadFunctionDefinition);
                 }
                 ([tok, rem @ ..], Some((nm, mut f))) => {
-                    f.push(tok.clone().to_instruction(Some(funcs)));
+                    f.push(tok.clone().to_instruction());
                     (rem, Some((nm, f)))
                 }
                 ([tok, rem @ ..], None) => {
                     if let Token::Identifier(_) = tok
                         && !self.undefined_functions.is_empty()
                     {
-                        self.flush_queue_and_recompile();
+                        self.reset_module_and_recompile_all();
+
+                        for (name, func) in &self.funcmap.0 {
+                            println!(
+                                "Function {name} | Wrapper @ {:?} | JIT @ {:?}",
+                                self.jit.get_function(func.wrapper_id),
+                                self.jit.get_function(func.id)
+                            );
+                        }
 
                         funcs = &mut self.funcmap;
                         stack = &mut self.stack;
                     }
 
-                    match Self::execute(
-                        funcs,
-                        stack,
-                        &self.jit,
-                        &tok.clone().to_instruction(Some(funcs)),
-                    )? {
+                    match Self::execute(funcs, stack, &self.jit, &tok.clone().to_instruction())? {
                         ExecRes::Executed => (rem, None),
                         ExecRes::Skip(n) => match rem.split_at_checked(n) {
                             Some((_, rem2)) => (rem2, None),
@@ -417,10 +403,10 @@ fn extract_functions(mut line: &[Token]) -> Result<HashMap<&str, Code>, CompileE
                 return Err(CompileError::BadFunctionDefinition);
             }
             ([tok, rem @ ..], Some((nm, mut f))) => {
-                f.push(tok.clone().to_instruction(None));
+                f.push(tok.clone().to_instruction());
                 (rem, Some((nm, f)))
             }
-            ([tok, rem @ ..], None) => return Err(CompileError::TopLevelDisallowed),
+            ([_, ..], None) => return Err(CompileError::TopLevelDisallowed),
             ([], Some(_)) => return Err(CompileError::BadFunctionDefinition),
             ([], None) => return Ok(res),
         };
@@ -428,7 +414,7 @@ fn extract_functions(mut line: &[Token]) -> Result<HashMap<&str, Code>, CompileE
 }
 
 pub fn compile_tokens(
-    mut line: &[Token],
+    line: &[Token],
     isa: OwnedTargetIsa,
     object_name: String,
 ) -> Result<ObjectProduct, CompileError> {

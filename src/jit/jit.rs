@@ -3,12 +3,15 @@ use std::{
     mem::transmute_copy,
 };
 
-use crate::types::{self, ArithOp, CRANELIFT_VALUE, Instr, JITFunction, JITState, MemOp};
+use crate::{
+    jit::analysis::function_results_from_following_jump_path_to_return_unless_side_effect_found,
+    types::{self, ArithOp, CRANELIFT_VALUE, Compiler, Instr, JITFunction, MemOp},
+};
 use ahash::{HashMap, HashMapExt};
 use cranelift::{
     codegen::{
         cursor::{Cursor, CursorPosition, FuncCursor},
-        ir::{BlockArg, FuncRef, InstructionData, Opcode, ValueDef},
+        ir::{FuncRef, InstructionData, Opcode, ValueDef},
     },
     frontend::Switch,
     prelude::{
@@ -19,7 +22,7 @@ use cranelift::{
     },
 };
 
-use types::FuncRef as ClacRef;
+use cranelift_jit::JITModule;
 use types::Function as ClacFunction;
 use types::Value as ClacValue;
 
@@ -81,7 +84,8 @@ fn emit_pick(bu: &mut FunctionBuilder, stack: Variable, offset: Value) {
 }
 
 #[cfg(debug_assertions)]
-fn debug_simulate_breaks(func: &[types::Instr]) {}
+// TODO: implement this
+fn _debug_simulate_breaks(_func: &[types::Instr]) {}
 
 fn get_block_breaks(func: &[types::Instr]) -> Result<BTreeSet<usize>, JITError> {
     let mut ret: BTreeSet<usize> = BTreeSet::new();
@@ -162,19 +166,17 @@ fn make_blockmap<'a>(
 }
 
 fn compile_block(
-    (head, ClacBlock(line, block)): (usize, &ClacBlock),
+    (head, &ClacBlock(line, block)): (usize, &ClacBlock),
     isa: &dyn TargetIsa,
     total_len: usize,
     blockmap: &BlockMap,
     calleemap: &HashMap<FuncId, FuncRef>,
-    funcs: &[ClacFunction],
+    funcs: &types::FuncMap,
     stack: Variable,
     bu: &mut FunctionBuilder,
     refs: &ImportRefs,
 ) {
     dbg_println!("compiling block = {:?}", block);
-    let line = *line;
-    let block = *block;
 
     bu.switch_to_block(block);
     bu.seal_block(block);
@@ -368,19 +370,13 @@ fn compile_block(
                 };
             }
             Instr::FunctionCall(func) => {
-                let ClacRef::Resolved(idx) = func else {
+                let Some(func) = funcs.lookup(func) else {
                     dbg_println!("TRYING TO CALL UNRESOLVED FUNCTION: {func:?}");
                     bu.ins().trap(TrapCode::unwrap_user(67));
                     return;
                 };
-                let ClacFunction::User(Some(funcid), _) = &funcs[*idx] else {
-                    dbg_println!("Could not get func={func:?}");
-                    bu.ins().trap(TrapCode::unwrap_user(67));
 
-                    return;
-                };
-
-                let func = calleemap.get(funcid).unwrap();
+                let func = calleemap[&func.id];
 
                 flush(&mut tmp, bu);
                 let final_stack = bu.use_var(stack);
@@ -390,7 +386,7 @@ fn compile_block(
                 //     return;
                 // }
 
-                let ret = bu.ins().call(*func, &[final_stack]);
+                let ret = bu.ins().call(func, &[final_stack]);
                 // update stack
                 let ret = bu.inst_results(ret)[0];
                 bu.def_var(stack, ret);
@@ -545,9 +541,6 @@ pub enum JITError {
 
     #[error("Detected a negative skip!")]
     BadSkip,
-
-    #[error("Could not compile due to function calling non-compiled function")]
-    CallsUnknownFunctions,
 }
 
 fn generate_clac_function_signature(isa: &dyn TargetIsa, callconv: CallConv) -> Signature {
@@ -561,54 +554,48 @@ fn generate_clac_function_signature(isa: &dyn TargetIsa, callconv: CallConv) -> 
     }
 }
 
-impl JITState {
+impl Compiler<JITModule> {
     pub(crate) fn get_function(&self, func: FuncId) -> JITFunction {
         unsafe { transmute_copy(&self.module.get_finalized_function(func)) }
     }
+}
 
-    fn generate_signature(&self, callconv: CallConv) -> Signature {
+impl<T: Module> Compiler<T> {
+    pub(crate) fn generate_signature(&self, callconv: CallConv) -> Signature {
         generate_clac_function_signature(self.module.isa(), callconv)
     }
 
     fn build_callee_map(
         &mut self,
         line: &[types::Instr],
-        funcs: &[ClacFunction],
+        funcs: &types::FuncMap,
     ) -> Result<HashMap<FuncId, FuncRef>, JITError> {
         let mut ret = HashMap::new();
 
         for instr in line {
-            if let Instr::FunctionCall(fr) = instr {
-                match fr {
-                    ClacRef::Resolved(idx) => {
-                        let func = &funcs[*idx];
-
-                        if let ClacFunction::User(Some(fid), _) = func {
-                            ret.insert(
-                                *fid,
-                                self.module.declare_func_in_func(*fid, &mut self.ctx.func),
-                            );
-                        } else {
-                            // Trying to call an uncompiled function.
-                            // return Err(JITError::CallsUnknownFunctions);
-                        }
-                    }
-                    ClacRef::Unresolved(_) => {
-                        //return Err(JITError::CallsUnknownFunctions)
-                    }
-                }
+            if let Instr::FunctionCall(funcref) = instr
+                && let Some(target) = funcs.lookup(funcref)
+            {
+                let ClacFunction { id, .. } = target;
+                ret.insert(
+                    *id,
+                    self.module.declare_func_in_func(*id, &mut self.ctx.func),
+                );
             }
         }
 
         Ok(ret)
     }
 
-    pub(crate) fn create_wrapper(&mut self, target: FuncId) -> ModuleResult<FuncId> {
+    pub(crate) fn define_wrapper(&mut self, function: &ClacFunction) -> ModuleResult<()> {
         self.module.clear_context(&mut self.ctx);
 
+        // TODO: fix
         self.ctx.func.signature = self.generate_signature(self.module.isa().default_call_conv());
 
-        let target = self.module.declare_func_in_func(target, &mut self.ctx.func);
+        let target = self
+            .module
+            .declare_func_in_func(function.id, &mut self.ctx.func);
 
         let mut bu = FunctionBuilder::new(&mut self.ctx.func, &mut self.fbctx);
         let entry = bu.create_block();
@@ -626,29 +613,27 @@ impl JITState {
 
         bu.finalize();
 
-        let dec = self
-            .module
-            .declare_anonymous_function(&self.ctx.func.signature)?;
+        self.module
+            .define_function(function.wrapper_id, &mut self.ctx)?;
 
-        self.module.define_function(dec, &mut self.ctx)?;
-
-        Ok(dec)
+        Ok(())
     }
 
-    pub(crate) fn compile_function(
+    pub(crate) fn define_function(
         &mut self,
-        id: FuncId,
-        line: &[types::Instr],
-        funcs: &[ClacFunction],
+        function: &ClacFunction,
+        funcs: &types::FuncMap,
     ) -> Result<(), CompilerError> {
         self.module.clear_context(&mut self.ctx);
 
-        let sig = self.generate_signature(CallConv::Tail);
+        // TODO: fix
+        self.ctx.func.signature = self.generate_signature(CallConv::Tail);
 
-        let callees = self.build_callee_map(line, funcs)?;
+        let callees = self.build_callee_map(&function.code, funcs)?;
+
         dbg_println!("Callees = {:?}", callees);
 
-        let types::JITState {
+        let types::Compiler {
             ctx,
             fbctx,
             module,
@@ -658,23 +643,22 @@ impl JITState {
                     quitfunc,
                     errorfunc,
                     powfunc,
-                    syscall,
+                    syscallfunc,
                 },
         } = self;
-
-        ctx.func.signature = sig;
 
         let refs = ImportRefs {
             printfunc: module.declare_func_in_func(*printfunc, &mut ctx.func),
             quitfunc: module.declare_func_in_func(*quitfunc, &mut ctx.func),
             errorfunc: module.declare_func_in_func(*errorfunc, &mut ctx.func),
             powfunc: module.declare_func_in_func(*powfunc, &mut ctx.func),
-            syscall: module.declare_func_in_func(*syscall, &mut ctx.func),
+            syscall: module.declare_func_in_func(*syscallfunc, &mut ctx.func),
         };
 
-        let breaks = get_block_breaks(line)?;
+        let breaks = get_block_breaks(&function.code)?;
         dbg_println!("{:?}", breaks);
-        let slice_map = breaks_to_slicemap(breaks, line);
+
+        let slice_map = breaks_to_slicemap(breaks, &function.code);
         dbg_println!("{:?}", slice_map);
 
         let mut bu = FunctionBuilder::new(&mut ctx.func, fbctx);
@@ -700,7 +684,7 @@ impl JITState {
             compile_block(
                 (*i, block),
                 module.isa(),
-                line.len(),
+                function.code.len(),
                 &block_map,
                 &callees,
                 funcs,
@@ -714,7 +698,7 @@ impl JITState {
 
         if let Some((_, ClacBlock(_, final_block))) = block_map.last_key_value() {
             // debug_assert!(final_block)
-            optimize_tailcall(&mut bu.func, *final_block);
+            optimize_tailcall(&mut bu.func);
         }
 
         bu.finalize();
@@ -725,7 +709,7 @@ impl JITState {
             ctx.set_disasm(true);
         }
 
-        module.define_function(id, ctx)?;
+        module.define_function(function.id, ctx)?;
 
         dbg_println!("Optimized IR: {}", ctx.func.display());
 
@@ -738,79 +722,10 @@ impl JITState {
     }
 }
 
-fn trivially_has_side_effects(opcode: cranelift::codegen::ir::Opcode) -> bool {
-    opcode.is_call()
-        || opcode.is_branch()
-        || opcode.is_terminator()
-        || opcode.is_return()
-        || opcode.can_trap()
-        || opcode.other_side_effects()
-        || opcode.can_store()
-    // || opcode.can_load()
-}
-
-// we need to make sure this return is the same as the resulting stack
-fn function_results_from_following_jump_path_to_return_unless_side_effect_found(
-    cursor: &mut FuncCursor,
-) -> Option<Vec<Value>> {
-    let mut mapper = HashMap::new();
-
-    while let Some(inst) = cursor.next_inst() {
-        let real = cursor.func.dfg.insts[inst];
-        // Ensure that the remaining functions do no side effects, and that the terminator == return || ALWAYS GOES TO the END BLOCK
-
-        match real {
-            InstructionData::Jump {
-                opcode: cranelift::codegen::ir::Opcode::Jump,
-                destination: bc,
-            } => {
-                let out = bc.block(&cursor.func.dfg.value_lists);
-
-                let jump_args = bc.args(&cursor.func.dfg.value_lists);
-                let block_args = cursor.func.dfg.block_params(out);
-
-                mapper.extend(block_args.iter().copied().zip(jump_args.map(|blockarg| {
-                    let BlockArg::Value(x) = blockarg else {
-                        panic!("Not value blockarg")
-                    };
-                    x
-                })));
-
-                cursor.set_position(CursorPosition::Before(out));
-            }
-            InstructionData::MultiAry {
-                opcode: Opcode::Return,
-                args: elist,
-            } => {
-                let mut ret = Vec::new();
-
-                dbg_println!("RESOLVED RETS: {mapper:?}");
-
-                for mut arg in elist.as_slice(&cursor.func.dfg.value_lists) {
-                    // resolve fully
-                    while let Some(next) = mapper.get(arg) {
-                        arg = next;
-                    }
-
-                    ret.push(*arg);
-                }
-
-                return Some(ret);
-            }
-            x if trivially_has_side_effects(x.opcode()) => return None,
-            _ => {}
-        }
-    }
-    unreachable!();
-}
-
-fn optimize_tailcall(
-    func: &mut cranelift::codegen::ir::Function,
-    final_block: cranelift::prelude::Block,
-) {
+fn optimize_tailcall(func: &mut cranelift::codegen::ir::Function) {
     let mut cursor = FuncCursor::new(func);
 
-    while let Some(cur_block) = cursor.next_block() {
+    while let Some(_cur_block) = cursor.next_block() {
         let mut to_tailcall = None;
 
         while let Some(inst) = cursor.next_inst() {
@@ -874,70 +789,15 @@ fn optimize_tailcall(
     }
 }
 
-impl types::ClacState {
-    pub(crate) fn declare_and_compile_all_functions(&mut self) -> ModuleResult<()> {
-        // declare all functions
-        self.declare_functions_in_jit_module()?;
-
-        // compile all functions
-        self.compile_all();
-
-        self.create_and_set_wrappers()?;
-
-        self.jit.module.finalize_definitions()?;
-
-        for (name, idx) in &self.funcmap.map {
-            let loc = &self.funcmap.functions[*idx];
-
-            if let ClacFunction::User(Some(id), _) = loc {
-                println!(
-                    "Function {name} = {loc:?} (JIT @ {:?})",
-                    self.jit.get_function(*id)
-                );
-            }
+impl<T: Module> Compiler<T> {
+    pub(crate) fn compile_functions_and_wrappers(
+        &mut self,
+        funcs: &types::FuncMap,
+    ) -> Result<(), CompilerError> {
+        for (_, function) in &funcs.0 {
+            self.define_function(&function, &funcs)?;
+            self.define_wrapper(&function)?;
         }
-
-        Ok(())
-    }
-
-    pub(crate) fn create_and_set_wrappers(&mut self) -> ModuleResult<()> {
-        for function in &mut self.funcmap.functions {
-            if let ClacFunction::User(funcid, _) = function {
-                *funcid = Some(self.jit.create_wrapper(funcid.unwrap())?);
-                dbg_println!("Generated wrapper: {funcid:?}");
-            }
-        }
-        Ok(())
-    }
-
-    // tries to compile all functions, ignoring the functions that fail to be compiled
-    pub(crate) fn compile_all(&mut self) {
-        // FIXME: remove clone
-        let clone = &self.funcmap.functions.clone();
-        for function in &mut self.funcmap.functions {
-            if let ClacFunction::User(fid, code) = function {
-                match self.jit.compile_function((*fid).unwrap(), code, clone) {
-                    Ok(()) => {
-                        dbg_println!("Successfully compiled {fid:?} (code = {code:?})");
-                    }
-                    Err(err) => {
-                        panic!("Could not compile {fid:?} because {err:?} (code = {code:?})",);
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) fn declare_functions_in_jit_module(&mut self) -> ModuleResult<()> {
-        let sig = self.jit.generate_signature(CallConv::Tail);
-
-        for function in &mut self.funcmap.functions {
-            if let ClacFunction::User(funcid, code) = function {
-                *funcid = Some(self.jit.module.declare_anonymous_function(&sig)?);
-                dbg_println!("Function {funcid:?} has code = {code:?}");
-            }
-        }
-
         Ok(())
     }
 }

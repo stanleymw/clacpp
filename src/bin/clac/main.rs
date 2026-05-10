@@ -4,6 +4,7 @@ use cranelift::prelude::{Configurable, isa::lookup};
 use std::io::Read;
 
 #[derive(clap::Parser)]
+#[clap(version)]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -11,9 +12,10 @@ pub struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
-    Compile {
-        file: std::path::PathBuf,
-    },
+    #[clap(alias = "c")]
+    Compile { file: std::path::PathBuf },
+
+    #[clap(alias = "r")]
     Run {
         file: Option<std::path::PathBuf>,
 

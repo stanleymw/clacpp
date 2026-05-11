@@ -316,6 +316,7 @@ impl ClacState {
                     (rem, Some((name, Vec::new())))
                 }
                 ([Token::Semicolon, rem @ ..], Some((name, f))) => {
+                    (crate::jit::analysis::create_graph(&f));
                     self.undefined_functions.push((name.to_string(), f));
 
                     // first, resolve function names to indices in FuncMap

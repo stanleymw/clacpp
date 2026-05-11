@@ -69,13 +69,14 @@ pub(crate) enum Instr {
     Swap,
     Rot,
     DropRange,
+    Pick,
 
+    // Math/Memory Instructions
     Arith(ArithOp),
     Mem(MemOp),
 
-    // Math Instructions
+    // Control Flow
     If,
-    Pick,
     Skip,
 }
 

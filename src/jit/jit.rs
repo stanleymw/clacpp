@@ -1,10 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     mem::transmute_copy,
+    rc::Rc,
 };
 
 use crate::{
-    jit::analysis::function_results_from_following_jump_path_to_return_unless_side_effect_found,
+    jit::analysis::{
+        self, function_results_from_following_jump_path_to_return_unless_side_effect_found,
+    },
     types::{self, ArithOp, CRANELIFT_VALUE, Compiler, Instr, JITFunction, MemOp},
 };
 use ahash::{HashMap, HashMapExt};
@@ -83,103 +86,20 @@ fn emit_pick(bu: &mut FunctionBuilder, stack: Variable, offset: Value) {
     emit_push(bu, stack, loaded);
 }
 
-#[cfg(debug_assertions)]
-// TODO: implement this
-fn _debug_simulate_breaks(_func: &[types::Instr]) {}
-
-fn get_block_breaks(func: &[types::Instr]) -> Result<BTreeSet<usize>, JITError> {
-    let mut ret: BTreeSet<usize> = BTreeSet::new();
-
-    let insert_checked = |set: &mut BTreeSet<usize>, val: usize| -> Result<bool, JITError> {
-        if val <= func.len() {
-            Ok(set.insert(val))
-        } else {
-            Err(JITError::IndeterminateControlFlow)
-        }
-    };
-
-    for (i, instr) in func.iter().enumerate() {
-        dbg_println!("{} {:?}", i, instr);
-        match instr {
-            Instr::If => {
-                // you can jump ahead by a fixed amount
-                insert_checked(&mut ret, i + 4)?;
-                insert_checked(&mut ret, i + 1)?;
-            }
-            Instr::Skip => {
-                // 2 cases:
-                // if there is no BREAK at this position, and the previous value is a constant, then we are guaranteed to know how much we are going to jump by.
-                // assuming that we have found all of the breaks up to this point. (TODO: PROVE THIS IS CORRECT)
-                if !ret.contains(&i)
-                    && i > 0
-                    && let Some(Instr::Literal(n)) = func.get(i - 1)
-                {
-                    // no break here, we can use constant optimization
-                    let conv: usize = (*n).try_into().map_err(|_| JITError::BadSkip)?;
-
-                    let new: usize = i + conv + 1;
-                    insert_checked(&mut ret, new)?;
-                } else {
-                    for new in (i + 1)..=func.len() {
-                        ret.insert(new);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    for i in &ret {
-        debug_assert!(*i <= func.len());
-    }
-
-    Ok(ret)
-}
-
-fn breaks_to_slicemap(
-    breaks: BTreeSet<usize>,
-    line: &[types::Instr],
-) -> BTreeMap<usize, &[types::Instr]> {
-    let mut last: usize = 0;
-    let mut res = BTreeMap::new();
-    for br in breaks {
-        res.insert(last, &line[last..br]);
-        last = br
-    }
-    res.insert(last, &line[last..]);
-
-    res
-}
-
-#[derive(Debug)]
-struct ClacBlock<'a>(&'a [types::Instr], cranelift::prelude::Block);
-
-type BlockMap<'a> = BTreeMap<usize, ClacBlock<'a>>;
-
-fn make_blockmap<'a>(
-    tree: BTreeMap<usize, &'a [types::Instr]>,
-    bu: &mut FunctionBuilder,
-) -> BlockMap<'a> {
-    tree.iter()
-        .map(|(i, instrs)| (*i, ClacBlock(instrs, bu.create_block())))
-        .collect()
-}
-
 fn compile_block(
-    (head, &ClacBlock(line, block)): (usize, &ClacBlock),
-    isa: &dyn TargetIsa,
-    total_len: usize,
-    blockmap: &BlockMap,
-    calleemap: &HashMap<FuncId, FuncRef>,
-    funcs: &types::FuncMap,
+    block: Rc<analysis::Block>,
     stack: Variable,
     bu: &mut FunctionBuilder,
+    isa: &dyn TargetIsa,
+    (funcs, calleemap): (&types::FuncMap, &HashMap<FuncId, FuncRef>),
+    (trap_block, term_block): (cranelift::prelude::Block, cranelift::prelude::Block),
     refs: &ImportRefs,
 ) {
-    dbg_println!("compiling block = {:?}", block);
+    // dbg_println!("compiling block = {:?}", block);
 
-    bu.switch_to_block(block);
-    bu.seal_block(block);
+    let cb = block.cranelift_block;
+    bu.switch_to_block(cb);
+    bu.seal_block(cb);
 
     // Idea:
     // 2 levels of stack
@@ -191,7 +111,6 @@ fn compile_block(
     // must also flush before Pick
     //
     // every function is fn(*mut ClacStack) -> *mut ClacStack
-
     let mut tmp: Vec<Value> = Vec::new();
 
     let flush = |tmp: &mut Vec<Value>, bu: &mut FunctionBuilder| {
@@ -209,8 +128,6 @@ fn compile_block(
     let xpop_no_value = |tmp: &mut Vec<Value>, bu: &mut FunctionBuilder| {
         tmp.pop().unwrap_or_else(|| emit_pop_loadless(bu, stack))
     };
-
-    let is_last_block = head == *blockmap.last_key_value().unwrap().0;
 
     let value_to_const =
         |func: &cranelift::codegen::ir::Function, val: Value| -> Option<ClacValue> {
@@ -231,9 +148,10 @@ fn compile_block(
             Some(num.into())
         };
 
+    let line = block.code.0;
+
     for (i, inst) in line.iter().enumerate() {
         use types::Instr;
-        let real_i = head + i;
 
         match inst {
             Instr::Literal(n) => {
@@ -316,58 +234,8 @@ fn compile_block(
 
                 emit_pick(bu, stack, popped);
             }
-            Instr::If => {
-                debug_assert!(i == line.len() - 1);
-
-                let cond = xpop(&mut tmp, bu);
-
-                let success = blockmap.get(&(real_i + 1)).unwrap().1;
-                let fail = blockmap.get(&(real_i + 4)).unwrap().1;
-
-                flush(&mut tmp, bu);
-                bu.ins().brif(cond, success, &[], fail, &[]);
-
-                return;
-            }
-            Instr::Skip => {
-                if i > 0
-                    && let Some(Instr::Literal(n)) = line.get(i - 1)
-                {
-                    assert_eq!(value_to_const(bu.func, tmp.pop().unwrap()).unwrap(), *n);
-
-                    // no break here, we can use constant optimization
-                    let conv: usize = (*n).try_into().ok().unwrap();
-
-                    let new: usize = real_i + conv + 1;
-                    let target = blockmap.get(&new).unwrap().1;
-
-                    flush(&mut tmp, bu);
-                    bu.ins().jump(target, &[]);
-
-                    return;
-                } else {
-                    debug_assert!(i == line.len() - 1);
-                    let mut switch = Switch::new();
-
-                    let start = real_i + 1;
-                    for new in start..=total_len {
-                        let found = blockmap.get(&new).unwrap().1;
-                        switch.set_entry((new - start) as u128, found);
-                    }
-                    let popped = xpop(&mut tmp, bu);
-
-                    // FIXME: dont create duplicates
-                    let abort = bu.create_block();
-
-                    flush(&mut tmp, bu);
-                    switch.emit(bu, popped, abort);
-
-                    bu.switch_to_block(abort);
-                    bu.seal_block(abort);
-                    bu.ins().trap(TrapCode::unwrap_user(67));
-
-                    return;
-                };
+            Instr::If | Instr::Skip => {
+                unreachable!("There should not be any control flow in this code")
             }
             Instr::FunctionCall(func) => {
                 let Some(func) = funcs.lookup(func) else {
@@ -509,20 +377,55 @@ fn compile_block(
         }
     }
 
-    flush(&mut tmp, bu);
+    // build terminator
 
-    if !is_last_block && let Some(next) = blockmap.get(&(head + line.len())) {
-        dbg_println!("GOT NEXT = {:?}", next);
-
+    let mut build_return = |bu: &mut FunctionBuilder, next: &analysis::Next| {
         flush(&mut tmp, bu);
-        bu.ins().jump(next.1, &[]);
-    } else {
-        // assert(FINAL BLOCK)
-        debug_assert!(head + line.len() == total_len);
+        match next {
+            analysis::Next::Trap => {
+                bu.ins().trap(TrapCode::unwrap_user(67));
+            }
+            analysis::Next::Terminate => {
+                let final_stack = bu.use_var(stack);
+                bu.ins().return_(&[final_stack]);
+            }
+            analysis::Next::Block(block) => {
+                bu.ins().jump(block.cranelift_block, &[]);
+            }
+        }
+    };
 
-        flush(&mut tmp, bu);
-        let final_stack = bu.use_var(stack);
-        bu.ins().return_(&[final_stack]);
+    let get_block = |next: &analysis::Next| match next {
+        analysis::Next::Trap => trap_block,
+        analysis::Next::Terminate => term_block,
+        analysis::Next::Block(block) => block.cranelift_block,
+    };
+
+    match &block.terminator {
+        analysis::Terminator::Jump(next) => build_return(bu, next),
+        analysis::Terminator::If { on_true, on_false } => {
+            let on_true = get_block(on_true);
+            let on_false = get_block(on_false);
+
+            println!("{}", bu.func.display());
+            let cond = xpop(&mut tmp, bu);
+
+            flush(&mut tmp, bu);
+            bu.ins().brif(cond, on_true, &[], on_false, &[]);
+        }
+        analysis::Terminator::Skip { targets } => {
+            let mut switch = Switch::new();
+
+            let targets: Vec<_> = targets.into_iter().map(get_block).collect();
+            for (i, block) in targets.into_iter().enumerate() {
+                switch.set_entry(i as u128, block);
+            }
+
+            let popped = xpop(&mut tmp, bu);
+
+            flush(&mut tmp, bu);
+            switch.emit(bu, popped, trap_block);
+        }
     }
 }
 
@@ -601,7 +504,6 @@ impl<T: Module> Compiler<T> {
         let entry = bu.create_block();
         bu.switch_to_block(entry);
         bu.seal_block(entry);
-
         bu.append_block_params_for_function_params(entry);
 
         let stack = bu.block_params(entry)[0];
@@ -626,11 +528,10 @@ impl<T: Module> Compiler<T> {
     ) -> Result<(), CompilerError> {
         self.module.clear_context(&mut self.ctx);
 
-        // TODO: fix
+        // TODO: fix when better function analysis is added
         self.ctx.func.signature = self.generate_signature(CallConv::Tail);
 
         let callees = self.build_callee_map(&function.code, funcs)?;
-
         dbg_println!("Callees = {:?}", callees);
 
         let types::Compiler {
@@ -655,51 +556,74 @@ impl<T: Module> Compiler<T> {
             syscall: module.declare_func_in_func(*syscallfunc, &mut ctx.func),
         };
 
-        let breaks = get_block_breaks(&function.code)?;
-        dbg_println!("{:?}", breaks);
-
-        let slice_map = breaks_to_slicemap(breaks, &function.code);
-        dbg_println!("{:?}", slice_map);
-
         let mut bu = FunctionBuilder::new(&mut ctx.func, fbctx);
+        let analyzed = analysis::create_graph(&function.code, &mut bu);
 
-        let block_map = make_blockmap(slice_map, &mut bu);
-        dbg_println!("{:?}", block_map);
+        let Some(entry) = analyzed.get(&0) else {
+            let x = bu.create_block();
 
-        let ClacBlock(_, entry) = block_map.get(&0).unwrap();
+            bu.switch_to_block(x);
+            bu.append_block_params_for_function_params(x);
 
-        let entry = *entry;
-        bu.switch_to_block(entry);
-        dbg_println!("entry = {}", entry);
-        bu.append_block_params_for_function_params(entry);
+            bu.seal_block(x);
 
-        let stack = bu.block_params(entry)[0];
+            let stack = bu.block_params(x)[0];
+
+            bu.ins().return_(&[stack]);
+
+            bu.finalize();
+
+            module.define_function(function.id, ctx)?;
+            dbg_println!("compiled empty function");
+
+            return Ok(());
+        };
+
+        // dbg_println!("entry = {:?}", entry);
+
+        let cb = entry.cranelift_block;
+
+        bu.append_block_params_for_function_params(cb);
+        bu.switch_to_block(cb);
+
+        let stack = bu.block_params(cb)[0];
 
         let stack_var = bu.declare_var(module.isa().pointer_type());
         bu.def_var(stack_var, stack);
 
         let stack = stack_var;
 
-        for (i, block) in &block_map {
+        let (trap_block, term_block) = (bu.create_block(), bu.create_block());
+
+        for (i, block) in analyzed {
             compile_block(
-                (*i, block),
-                module.isa(),
-                function.code.len(),
-                &block_map,
-                &callees,
-                funcs,
+                block,
                 stack,
                 &mut bu,
+                module.isa(),
+                (funcs, &callees),
+                (trap_block, term_block),
                 &refs,
             );
         }
 
+        // create trap and term block
+        bu.switch_to_block(trap_block);
+        bu.ins().trap(TrapCode::unwrap_user(67));
+        bu.seal_block(trap_block);
+
+        bu.switch_to_block(term_block);
+        let stack_final = bu.use_var(stack);
+        bu.ins().return_(&[stack_final]);
+        bu.seal_block(term_block);
+
         dbg_println!("Before tailcall IR: {}", bu.func.display());
 
-        if let Some((_, ClacBlock(_, final_block))) = block_map.last_key_value() {
-            // debug_assert!(final_block)
-            optimize_tailcall(&mut bu.func);
-        }
+        // TODO: tailcall?
+        // if let Some((_, CraneliftedBlock(_, final_block))) = block_map.last_key_value() {
+        //     // debug_assert!(final_block)
+        //     optimize_tailcall(&mut bu.func);
+        // }
 
         bu.finalize();
 

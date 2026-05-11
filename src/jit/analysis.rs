@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    mem::MaybeUninit,
     rc::Rc,
 };
 
@@ -13,10 +12,10 @@ use cranelift::codegen::{
 use crate::types::{self, Instr};
 
 #[derive(Debug)]
-pub(crate) struct Code<'inst, const NO_CONTROL_FLOW_INSTRUCTIONS: bool>(&'inst [Instr]);
+pub(crate) struct Code<'inst, const NO_CONTROL_FLOW_INSTRUCTIONS: bool>(pub(crate) &'inst [Instr]);
 
 #[derive(Debug)]
-enum Terminator<'inst> {
+pub(crate) enum Terminator<'inst> {
     Jump(Next<'inst>),
     If {
         on_true: Next<'inst>,
@@ -37,8 +36,9 @@ pub(crate) enum Next<'inst> {
 #[derive(Debug)]
 // Each variant is the type of terminator
 pub(crate) struct Block<'inst> {
-    code: Code<'inst, true>,
-    terminator: Terminator<'inst>,
+    pub(crate) code: Code<'inst, true>,
+    pub(crate) cranelift_block: cranelift::prelude::Block,
+    pub(crate) terminator: Terminator<'inst>,
 }
 
 impl<'inst> TryFrom<&'inst [types::Instr]> for Code<'inst, true> {
@@ -62,6 +62,10 @@ macro_rules! dbg_println {
         println!($($args)*)
     };
 }
+
+#[cfg(debug_assertions)]
+// TODO: implement this
+fn _debug_simulate_breaks(_func: &[types::Instr]) {}
 
 fn get_block_breaks_v2(func: &[types::Instr]) -> BTreeSet<usize> {
     let mut breaks = BTreeSet::new();
@@ -112,6 +116,7 @@ fn get_block_breaks_v2(func: &[types::Instr]) -> BTreeSet<usize> {
 
 pub(crate) fn create_graph<'inst>(
     func: &'inst [types::Instr],
+    bu: &mut cranelift::prelude::FunctionBuilder,
 ) -> BTreeMap<usize, Rc<Block<'inst>>> {
     let breaks: Vec<usize> = get_block_breaks_v2(func).into_iter().collect();
     debug_assert!(breaks.is_sorted());
@@ -156,6 +161,7 @@ pub(crate) fn create_graph<'inst>(
             Instr::If => {
                 let new = Block {
                     code: begin.try_into().unwrap(),
+                    cranelift_block: bu.create_block(),
                     terminator: Terminator::If {
                         on_true: get_next(&out, start + code.len()),
                         on_false: get_next(&out, start + code.len() + 3),
@@ -170,6 +176,7 @@ pub(crate) fn create_graph<'inst>(
             {
                 let new = Block {
                     code: begin2.try_into().unwrap(),
+                    cranelift_block: bu.create_block(),
                     terminator: Terminator::Jump(get_next(&out, start + code.len() + conv)),
                 };
 
@@ -178,6 +185,7 @@ pub(crate) fn create_graph<'inst>(
             Instr::Skip => {
                 let new = Block {
                     code: begin.try_into().unwrap(),
+                    cranelift_block: bu.create_block(),
                     terminator: Terminator::Skip {
                         targets: ((start + code.len())..=func.len())
                             .map(|val| get_next(&out, val))
@@ -190,6 +198,7 @@ pub(crate) fn create_graph<'inst>(
             _ => {
                 let new = Block {
                     code: code.try_into().unwrap(),
+                    cranelift_block: bu.create_block(),
                     terminator: Terminator::Jump(get_next(&out, start + code.len())),
                 };
 
@@ -198,7 +207,7 @@ pub(crate) fn create_graph<'inst>(
         };
     }
 
-    dbg_println!("{:?}", out);
+    // dbg_println!("{:?}", out);
 
     out
 }

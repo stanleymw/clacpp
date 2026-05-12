@@ -410,7 +410,6 @@ fn compile_block(
             let on_true = get_block(on_true);
             let on_false = get_block(on_false);
 
-            println!("{}", bu.func.display());
             let cond = xpop(&mut tmp, bu);
 
             flush(&mut tmp, bu);

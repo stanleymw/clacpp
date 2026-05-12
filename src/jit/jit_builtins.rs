@@ -1,5 +1,3 @@
-use thiserror::Error;
-
 use crate::{builtins, types};
 
 pub(crate) extern "C" fn quit() {
@@ -16,17 +14,18 @@ pub(crate) extern "C" fn pow(x: types::Value, y: types::Value) -> types::Value {
     }
 }
 
-#[derive(Debug, Error)]
-#[repr(i64)]
-pub(crate) enum CompiledExecutionError {
-    #[error("An error occured! Clac exiting.")]
-    Error,
-}
+// TODO: potentially implement this
+// #[derive(Debug, Error)]
+// #[repr(i64)]
+// pub(crate) enum CompiledExecutionError {
+//     #[error("An error occured! Clac exiting.")]
+//     Error,
+// }
 
-pub(crate) extern "C" fn error(err: CompiledExecutionError) {
-    eprintln!("{}", err);
-    std::process::exit(1);
-}
+// pub(crate) extern "C" fn error(err: CompiledExecutionError) {
+//     eprintln!("{}", err);
+//     std::process::exit(1);
+// }
 
 pub(crate) extern "C" fn print_value(val: types::Value) {
     println!("{}", val)

@@ -20,10 +20,6 @@ pub type Value = i64;
 // pub const CRANELIFT_VALUE: cranelift::prelude::Type = Type::int(Value::BITS).unwrap();
 pub const CRANELIFT_VALUE: cranelift::prelude::Type = I64;
 
-pub(crate) type ValueStack = Vec<Value>;
-
-type FunctionIndex = usize;
-
 // pub(crate) enum FuncRef {
 //     Resolved(FunctionIndex),
 //     Unresolved(String),
@@ -135,13 +131,6 @@ pub(crate) type Code = Vec<Instr>;
 // }
 
 pub(crate) type JITFunction = unsafe extern "C" fn(*mut Value) -> *mut Value;
-
-#[derive(Debug, Clone)]
-pub(crate) struct CraneliftedFunction {
-    pub(crate) code: Code,
-    pub(crate) id: FuncId,
-    pub(crate) wrapper_id: FuncId,
-}
 
 pub(crate) type CallStack<'a> = Vec<&'a [Instr]>;
 

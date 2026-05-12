@@ -1,6 +1,6 @@
 use clac_lang::types::*;
 use clap::Parser;
-use cranelift::prelude::{Configurable, isa::lookup};
+use cranelift::prelude::Configurable;
 use std::io::Read;
 
 #[derive(clap::Parser)]

@@ -6,7 +6,10 @@ use crate::{
 };
 use ahash::{HashMap, HashMapExt};
 use cranelift::{
-    codegen::ir::{FuncRef, InstructionData, Opcode, ValueDef},
+    codegen::{
+        control::ControlPlane,
+        ir::{FuncRef, InstructionData, Opcode, ValueDef},
+    },
     frontend::Switch,
     prelude::{
         AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, Signature,
@@ -530,6 +533,10 @@ impl<T: Module> Compiler<T> {
         isa: &dyn TargetIsa,
         refs: ImportRefs,
     ) -> Result<cranelift::codegen::Context, CompilerError> {
+        if cfg!(feature = "debug") {
+            ctx.set_disasm(true);
+        }
+
         let mut fbctx = FunctionBuilderContext::new();
 
         // TODO: fix when better function analysis is added
@@ -598,10 +605,6 @@ impl<T: Module> Compiler<T> {
 
         bu.finalize();
 
-        if cfg!(feature = "debug") {
-            ctx.set_disasm(true);
-        }
-
         Ok(ctx)
     }
 }
@@ -660,22 +663,44 @@ impl<T: Module> Compiler<T> {
         let res: HashMap<_, _> = x
             .into_par_iter()
             .map(|(name, (code, ctx, callees, refs))| {
-                (
-                    name,
-                    Self::compile_function(code, ctx, &declared, callees, isa, refs).unwrap(),
-                )
+                // println!("Running on thread: {:?}", std::thread::current().id());
+                let mut translated =
+                    Self::compile_function(code, ctx, &declared, callees, isa, refs).unwrap();
+
+                translated
+                    .compile(isa, &mut ControlPlane::default())
+                    .unwrap();
+
+                (name, translated)
             })
             .collect();
 
-        for (name, mut ctx) in res {
-            self.module
-                .define_function(*declared.get(name).unwrap(), &mut ctx)?;
+        for (name, ctx) in res {
+            // TODO: We have to do this because module.define_function re-compiles the Context for some reason. Currently cranelift does not seem to have an API to do this. (defining a function from a context without re-compiling)
+            let buffer = &ctx.compiled_code().unwrap().buffer;
+            let func_id = *declared.get(name).unwrap();
+
+            let relocs: Vec<_> = buffer
+                .relocs()
+                .iter()
+                .map(|reloc| {
+                    cranelift_module::ModuleReloc::from_mach_reloc(&reloc, &ctx.func, func_id)
+                })
+                .collect();
+
+            self.module.define_function_bytes(
+                func_id,
+                buffer.alignment as u64,
+                buffer.data(),
+                relocs.as_slice(),
+            )?;
+
             dbg_println!("{name} IR: {}", ctx.func.display());
 
-            // dbg_println!(
-            //     "Disassembly of {name}: {}",
-            //     ctx.compiled_code().unwrap().vcode.as_ref().unwrap()
-            // );
+            dbg_println!(
+                "Disassembly of {name}: {}",
+                ctx.compiled_code().unwrap().vcode.as_ref().unwrap()
+            );
         }
 
         let mut ctx = self.module.make_context();

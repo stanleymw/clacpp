@@ -3,10 +3,7 @@ use std::fmt::Debug;
 use std::io;
 
 use ahash::{HashMap, HashMapExt};
-use cranelift::{
-    codegen::Context,
-    prelude::{AbiParam, FunctionBuilderContext, Signature, types::I64},
-};
+use cranelift::prelude::{AbiParam, Signature, types::I64};
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::{FuncId, Module};
 use thiserror::Error;
@@ -140,7 +137,6 @@ pub(crate) struct Imports {
     pub(crate) quitfunc: FuncId,
     pub(crate) powfunc: FuncId,
     pub(crate) syscallfunc: FuncId,
-    pub(crate) errorfunc: FuncId,
 }
 
 pub(crate) struct Compiler<T> {
@@ -242,16 +238,6 @@ pub(crate) fn declare_imports(
         },
     )?;
 
-    let errorfunc = module.declare_function(
-        "__rerror__",
-        cranelift_module::Linkage::Import,
-        &Signature {
-            params: vec![valparam],
-            returns: vec![],
-            call_conv: module.isa().default_call_conv(),
-        },
-    )?;
-
     let quitfunc = module.declare_function(
         "__rquit__",
         cranelift_module::Linkage::Import,
@@ -277,7 +263,6 @@ pub(crate) fn declare_imports(
         quitfunc,
         powfunc,
         syscallfunc,
-        errorfunc,
     })
 }
 
@@ -300,7 +285,6 @@ impl Compiler<JITModule> {
 
         builder.symbol("__rprint__", jit_builtins::print_value as *const u8);
         builder.symbol("__rquit__", jit_builtins::quit as *const u8);
-        builder.symbol("__rerr__", jit_builtins::error as *const u8);
         builder.symbol("__rpow__", jit_builtins::pow as *const u8);
         builder.symbol("__syscall__", builtins::syscall as *const u8);
 
@@ -371,10 +355,11 @@ impl ClacState {
     }
 }
 
-pub(crate) enum ExecRes<'a> {
+pub(crate) enum ExecRes {
     Executed,
     Skip(usize),
-    RecursiveCall(&'a [Instr]),
+    // TODO: add this back for Non-JIT mode
+    // RecursiveCall(&'a [Instr]),
 }
 
 #[derive(Debug, Error)]

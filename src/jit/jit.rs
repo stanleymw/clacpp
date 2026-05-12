@@ -1,17 +1,12 @@
 use std::{mem::transmute_copy, rc::Rc};
 
 use crate::{
-    jit::analysis::{
-        self, function_results_from_following_jump_path_to_return_unless_side_effect_found,
-    },
+    jit::analysis::{self},
     types::{self, ArithOp, CRANELIFT_VALUE, Compiler, Instr, JITFunction, MemOp},
 };
 use ahash::{HashMap, HashMapExt};
 use cranelift::{
-    codegen::{
-        cursor::{Cursor, CursorPosition, FuncCursor},
-        ir::{FuncRef, InstructionData, Opcode, ValueDef},
-    },
+    codegen::ir::{FuncRef, InstructionData, Opcode, ValueDef},
     frontend::Switch,
     prelude::{
         AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, Signature,
@@ -434,7 +429,6 @@ fn compile_block(
 pub(crate) struct ImportRefs {
     printfunc: FuncRef,
     quitfunc: FuncRef,
-    errorfunc: FuncRef,
     powfunc: FuncRef,
     syscall: FuncRef,
 }
@@ -602,12 +596,6 @@ impl<T: Module> Compiler<T> {
         bu.ins().return_(&[stack_final]);
         bu.seal_block(term_block);
 
-        // TODO: tailcall?
-        // if let Some((_, CraneliftedBlock(_, final_block))) = block_map.last_key_value() {
-        //     // debug_assert!(final_block)
-        //     optimize_tailcall(&mut bu.func);
-        // }
-
         bu.finalize();
 
         if cfg!(feature = "debug") {
@@ -615,73 +603,6 @@ impl<T: Module> Compiler<T> {
         }
 
         Ok(ctx)
-    }
-}
-
-fn optimize_tailcall(func: &mut cranelift::codegen::ir::Function) {
-    let mut cursor = FuncCursor::new(func);
-
-    while let Some(_cur_block) = cursor.next_block() {
-        let mut to_tailcall = None;
-
-        while let Some(inst) = cursor.next_inst() {
-            let real = cursor.func.dfg.insts[inst];
-            if let InstructionData::Call {
-                opcode: _,
-                args,
-                func_ref,
-            } = real
-            {
-                to_tailcall = Some((inst, args, func_ref));
-                continue;
-            }
-        }
-
-        let Some((badcall, args, func_ref)) = to_tailcall else {
-            continue;
-        };
-
-        cursor.goto_inst(badcall);
-
-        let pos = cursor.position();
-        debug_assert_eq!(pos, CursorPosition::At(badcall));
-
-        let ret = function_results_from_following_jump_path_to_return_unless_side_effect_found(
-            &mut cursor,
-        );
-
-        cursor.set_position(pos);
-        debug_assert_eq!(cursor.position(), CursorPosition::At(badcall));
-
-        let Some(ret_args) = ret else {
-            continue;
-        };
-
-        // result from our call
-        let resulting_stack = cursor.func.dfg.inst_results(badcall);
-        // returning to the function
-        if ret_args != resulting_stack {
-            continue;
-        }
-
-        dbg_println!("TAIL CALLING: {to_tailcall:?}");
-
-        let new = cursor.func.dfg.make_inst(InstructionData::Call {
-            opcode: cranelift::codegen::ir::Opcode::ReturnCall,
-            args,
-            func_ref,
-        });
-
-        // TODO: BUG IN CRANELIFT DOCUMENTAITON?? it seems to move the cursor forward
-        cursor.replace_inst(new);
-        let bug_workaround = cursor.prev_inst().unwrap();
-
-        debug_assert_eq!(bug_workaround, new);
-
-        while let Some(next) = cursor.next_inst() {
-            let removed = cursor.remove_inst_and_step_back();
-            debug_assert_eq!(next, removed);
-        }
     }
 }
 
@@ -697,7 +618,6 @@ impl<T: Module> Compiler<T> {
             quitfunc,
             powfunc,
             syscallfunc,
-            errorfunc,
         } = self.imports;
 
         let declared: HashMap<&str, FuncId> = funcs
@@ -728,7 +648,6 @@ impl<T: Module> Compiler<T> {
                 let refs = ImportRefs {
                     printfunc: self.module.declare_func_in_func(printfunc, &mut ctx.func),
                     quitfunc: self.module.declare_func_in_func(quitfunc, &mut ctx.func),
-                    errorfunc: self.module.declare_func_in_func(errorfunc, &mut ctx.func),
                     powfunc: self.module.declare_func_in_func(powfunc, &mut ctx.func),
                     syscall: self.module.declare_func_in_func(syscallfunc, &mut ctx.func),
                 };

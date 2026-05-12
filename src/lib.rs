@@ -4,9 +4,9 @@ pub mod types;
 
 use ahash::{HashMap, HashMapExt};
 
-use cranelift::prelude::{FunctionBuilderContext, isa::OwnedTargetIsa};
+use cranelift::prelude::isa::OwnedTargetIsa;
 use cranelift_jit::JITModule;
-use cranelift_module::{Module, ModuleError};
+use cranelift_module::ModuleError;
 use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 use thiserror::Error;
 use types::*;
@@ -40,11 +40,11 @@ fn parse(token: &str) -> Token {
 }
 
 impl ClacState {
-    fn execute<'cs>(
+    fn execute(
         stack: &mut Stack,
         jit: &Option<(JITModule, HashMap<String, cranelift_module::FuncId>)>,
         token: &Instr,
-    ) -> Result<ExecRes<'cs>, ExecError> {
+    ) -> Result<ExecRes, ExecError> {
         let mut xpop = || stack.pop().ok_or(ExecError::MissingArguments);
 
         match token {
@@ -257,12 +257,12 @@ impl ClacState {
                     }
                     None => return Err(ExecError::InvalidSkip),
                 },
-                ExecRes::RecursiveCall(newfunc) => {
-                    // TODO: tailcall optimization
-                    optimize_push(xs);
+                // ExecRes::RecursiveCall(newfunc) => {
+                //     // TODO: tailcall optimization
+                //     optimize_push(xs);
 
-                    callstack.push(newfunc);
-                }
+                //     callstack.push(newfunc);
+                // }
             }
         }
 
@@ -294,7 +294,6 @@ impl ClacState {
     pub fn execute_tokens(&mut self, mut line: &[Token]) -> Result<(), ExecError> {
         let mut cur_func: Option<(&String, Code)> = None;
 
-        let mut funcs = &mut self.funcmap;
         let mut stack = &mut self.stack;
 
         loop {
@@ -333,7 +332,6 @@ impl ClacState {
                             println!("No JIT!")
                         }
 
-                        funcs = &mut self.funcmap;
                         stack = &mut self.stack;
                     }
 
@@ -343,10 +341,10 @@ impl ClacState {
                             Some((_, rem2)) => (rem2, None),
                             None => return Err(ExecError::InvalidSkip),
                         },
-                        ExecRes::RecursiveCall(f) => {
-                            Self::exec_function(stack, &self.jit, vec![f])?;
-                            (rem, None)
-                        }
+                        // ExecRes::RecursiveCall(f) => {
+                        //     Self::exec_function(stack, &self.jit, vec![f])?;
+                        //     (rem, None)
+                        // }
                     }
                 }
                 ([], Some(_)) => return Err(ExecError::BadFunctionDefinition),
@@ -418,15 +416,11 @@ pub fn compile_tokens(
     let mut module = ObjectModule::new(module);
 
     let declared = declare_imports(&mut module)?;
-    let ctx = module.make_context();
 
-    let mut compiler = Compiler {
+    let compiler = Compiler {
         module,
         imports: declared,
     };
-
-    let externc = compiler.generate_signature(compiler.module.isa().default_call_conv());
-    let tail = compiler.generate_signature(cranelift::prelude::isa::CallConv::Tail);
 
     let functions: FuncMap = extract_functions(line)?
         .into_iter()

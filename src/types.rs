@@ -2,7 +2,7 @@ use core::{fmt, slice};
 use std::fmt::Debug;
 use std::io;
 
-use ahash::HashMap;
+use ahash::{HashMap, HashMapExt};
 use cranelift::{
     codegen::Context,
     prelude::{AbiParam, FunctionBuilderContext, Signature, types::I64},
@@ -137,22 +137,13 @@ pub(crate) type Code = Vec<Instr>;
 pub(crate) type JITFunction = unsafe extern "C" fn(*mut Value) -> *mut Value;
 
 #[derive(Debug, Clone)]
-pub(crate) struct Function {
+pub(crate) struct CraneliftedFunction {
     pub(crate) code: Code,
     pub(crate) id: FuncId,
     pub(crate) wrapper_id: FuncId,
 }
 
 pub(crate) type CallStack<'a> = Vec<&'a [Instr]>;
-
-#[derive(Debug, Default)]
-pub(crate) struct FuncMap(pub(crate) HashMap<String, Function>);
-
-impl FuncMap {
-    pub(crate) fn lookup(&self, FuncRef(target): &FuncRef) -> Option<&Function> {
-        self.0.get(target)
-    }
-}
 
 // TODO: make a macro to do this
 pub(crate) struct Imports {
@@ -165,21 +156,21 @@ pub(crate) struct Imports {
 
 pub(crate) struct Compiler<T> {
     pub(crate) module: T,
-    pub(crate) fbctx: FunctionBuilderContext,
-    pub(crate) ctx: Context,
 
     pub(crate) imports: Imports,
 }
 
+pub(crate) type FuncMap = HashMap<String, Code>;
+
 /// The primary struct representing the state of the Clac++ machine.
 pub struct ClacState {
     // JIT Stuff
-    pub(crate) jit: Compiler<JITModule>, // TODO: make JIT optional
+    pub(crate) jit: Option<(JITModule, HashMap<String, FuncId>)>, // TODO: make JIT optional
 
     pub(crate) undefined_functions: Vec<(String, Code)>,
     // Clac Stuff
     pub(crate) stack: Stack,
-    pub(crate) funcmap: FuncMap,
+    pub(crate) funcmap: FuncMap, // Map of defined functions
 }
 
 pub(crate) struct Stack {
@@ -325,16 +316,10 @@ impl Compiler<JITModule> {
         builder.symbol("__syscall__", builtins::syscall as *const u8);
 
         let mut module = cranelift_jit::JITModule::new(builder);
-        let ctx = module.make_context();
 
         let imports = declare_imports(&mut module)?;
 
-        Ok(Compiler {
-            module,
-            fbctx: FunctionBuilderContext::new(),
-            ctx,
-            imports,
-        })
+        Ok(Compiler { module, imports })
     }
 }
 
@@ -353,10 +338,10 @@ pub enum ReplError {
 impl ClacState {
     pub fn new(capacity: usize) -> Result<Self, InitError> {
         Ok(ClacState {
-            jit: Compiler::new()?,
+            jit: None,
             stack: Stack::new(capacity)?,
             undefined_functions: Vec::new(),
-            funcmap: FuncMap::default(),
+            funcmap: HashMap::new(),
         })
     }
 

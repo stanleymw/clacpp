@@ -11,7 +11,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule, ObjectProduct};
 use thiserror::Error;
 use types::*;
 
-use crate::jit::jit::CompilerError;
+use crate::jit::jit::{CompilerError, get_function};
 
 fn parse(token: &str) -> Token {
     use Token::*;
@@ -41,9 +41,8 @@ fn parse(token: &str) -> Token {
 
 impl ClacState {
     fn execute<'cs>(
-        functions: &'cs FuncMap,
         stack: &mut Stack,
-        jit: &Compiler<JITModule>,
+        jit: &Option<(JITModule, HashMap<String, cranelift_module::FuncId>)>,
         token: &Instr,
     ) -> Result<ExecRes<'cs>, ExecError> {
         let mut xpop = || stack.pop().ok_or(ExecError::MissingArguments);
@@ -55,11 +54,15 @@ impl ClacState {
             }
             Instr::Quit => Err(ExecError::Quit),
             Instr::FunctionCall(state) => {
-                let Some(f) = functions.lookup(state) else {
+                let Some((module, map)) = jit else {
+                    panic!("No JIT")
+                };
+
+                let Some(f) = map.get(&state.0) else {
                     return Err(ExecError::UnknownFunction(state.0.to_string()));
                 };
 
-                let asm = jit.get_function(f.id);
+                let asm = get_function(module, *f);
 
                 let new_rsp = unsafe { asm(stack.rsp) };
                 stack.rsp = new_rsp;
@@ -221,9 +224,8 @@ impl ClacState {
 
     // we have to split execute_line and this version, due to lifetime problems. When you call clac functions, it will be executing in this context, where the FunctionMap CANNOT be modified, since you cannot define functions within a function.
     fn exec_function<'cs>(
-        funcs: &'cs FuncMap,
         stack: &mut Stack,
-        jit: &Compiler<JITModule>,
+        jit: &Option<(JITModule, HashMap<String, cranelift_module::FuncId>)>,
         mut callstack: CallStack<'cs>,
     ) -> Result<(), ExecError> {
         while let Some(line) = callstack.pop() {
@@ -241,7 +243,7 @@ impl ClacState {
                 }
             };
 
-            match Self::execute(funcs, stack, jit, token)? {
+            match Self::execute(stack, jit, token)? {
                 ExecRes::Executed => {
                     if !xs.is_empty() {
                         callstack.push(xs);
@@ -268,39 +270,24 @@ impl ClacState {
     }
 
     fn reset_module_and_recompile_all(&mut self) {
-        // Reset the JIT
-        let old = std::mem::replace(&mut self.jit, Compiler::new().unwrap());
-        unsafe { old.module.free_memory() };
-
-        let externc = self
-            .jit
-            .generate_signature(self.jit.module.isa().default_call_conv());
-
-        let tail = self
-            .jit
-            .generate_signature(cranelift::prelude::isa::CallConv::Tail);
-
+        // update function map
         for (name, f) in self.undefined_functions.drain(..) {
-            self.funcmap.0.insert(
-                name,
-                Function {
-                    code: f,
-                    id: self.jit.module.declare_anonymous_function(&tail).unwrap(),
-                    wrapper_id: self
-                        .jit
-                        .module
-                        .declare_anonymous_function(&externc)
-                        .unwrap(),
-                },
-            );
+            self.funcmap.insert(name, f);
         }
 
         assert!(self.undefined_functions.is_empty());
 
-        self.jit
-            .compile_functions_and_wrappers(&self.funcmap)
-            .unwrap();
-        self.jit.module.finalize_definitions().unwrap();
+        // create new compiler
+        let new = Compiler::new().unwrap();
+        let mut out = new.compile(&self.funcmap).unwrap();
+
+        out.0.finalize_definitions().unwrap();
+
+        // Reset the JIT
+        let old = std::mem::replace(&mut self.jit, Some(out));
+        if let Some((old_module, _)) = old {
+            unsafe { old_module.free_memory() };
+        }
     }
 
     /// Execute a slice of [`Token`]s representing a line of Clac++ code.
@@ -335,26 +322,29 @@ impl ClacState {
                     {
                         self.reset_module_and_recompile_all();
 
-                        for (name, func) in &self.funcmap.0 {
-                            println!(
-                                "Function {name} | Wrapper @ {:?} | JIT @ {:?}",
-                                self.jit.get_function(func.wrapper_id),
-                                self.jit.get_function(func.id)
-                            );
+                        if let Some((jit, map)) = &self.jit {
+                            for (name, func) in map {
+                                println!(
+                                    "Function {name} | Wrapper @ {:?}",
+                                    jit.get_finalized_function(*func),
+                                );
+                            }
+                        } else {
+                            println!("No JIT!")
                         }
 
                         funcs = &mut self.funcmap;
                         stack = &mut self.stack;
                     }
 
-                    match Self::execute(funcs, stack, &self.jit, &tok.clone().to_instruction())? {
+                    match Self::execute(stack, &self.jit, &tok.clone().to_instruction())? {
                         ExecRes::Executed => (rem, None),
                         ExecRes::Skip(n) => match rem.split_at_checked(n) {
                             Some((_, rem2)) => (rem2, None),
                             None => return Err(ExecError::InvalidSkip),
                         },
                         ExecRes::RecursiveCall(f) => {
-                            Self::exec_function(funcs, stack, &self.jit, vec![f])?;
+                            Self::exec_function(stack, &self.jit, vec![f])?;
                             (rem, None)
                         }
                     }
@@ -432,39 +422,19 @@ pub fn compile_tokens(
 
     let mut compiler = Compiler {
         module,
-        fbctx: FunctionBuilderContext::new(),
-        ctx,
         imports: declared,
     };
 
     let externc = compiler.generate_signature(compiler.module.isa().default_call_conv());
     let tail = compiler.generate_signature(cranelift::prelude::isa::CallConv::Tail);
 
-    let functions: FuncMap = FuncMap(
-        extract_functions(line)?
-            .into_iter()
-            .map(|(name, code)| {
-                let id = compiler.module.declare_anonymous_function(&tail).unwrap();
-                let wrapper_id = compiler
-                    .module
-                    .declare_function(name, cranelift_module::Linkage::Export, &externc)
-                    .unwrap();
+    let functions: FuncMap = extract_functions(line)?
+        .into_iter()
+        .map(|(name, code)| (name.to_string(), code))
+        .collect();
 
-                (
-                    name.to_string(),
-                    Function {
-                        code,
-                        id,
-                        wrapper_id,
-                    },
-                )
-            })
-            .collect(),
-    );
-
-    compiler.compile_functions_and_wrappers(&functions)?;
-
-    Ok(compiler.module.finish())
+    let res = compiler.compile(&functions)?;
+    Ok(res.0.finish())
 }
 
 pub fn compile_str(

@@ -1,8 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    mem::transmute_copy,
-    rc::Rc,
-};
+use std::{mem::transmute_copy, rc::Rc};
 
 use crate::{
     jit::analysis::{
@@ -18,15 +14,15 @@ use cranelift::{
     },
     frontend::Switch,
     prelude::{
-        AbiParam, FunctionBuilder, InstBuilder, IntCC, MemFlags, Signature, TrapCode, Value,
-        Variable,
+        AbiParam, FunctionBuilder, FunctionBuilderContext, InstBuilder, IntCC, MemFlags, Signature,
+        TrapCode, Value, Variable,
         isa::{CallConv, TargetIsa},
         types::I64,
     },
 };
 
 use cranelift_jit::JITModule;
-use types::Function as ClacFunction;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use types::Value as ClacValue;
 
 use cranelift_module::{FuncId, Module, ModuleError, ModuleResult};
@@ -91,7 +87,7 @@ fn compile_block(
     stack: Variable,
     bu: &mut FunctionBuilder,
     isa: &dyn TargetIsa,
-    (funcs, calleemap): (&types::FuncMap, &HashMap<FuncId, FuncRef>),
+    (funcs, calleemap): (&HashMap<&str, FuncId>, &HashMap<FuncId, FuncRef>),
     (trap_block, term_block): (cranelift::prelude::Block, cranelift::prelude::Block),
     refs: &ImportRefs,
 ) {
@@ -238,13 +234,13 @@ fn compile_block(
                 unreachable!("There should not be any control flow in this code")
             }
             Instr::FunctionCall(func) => {
-                let Some(func) = funcs.lookup(func) else {
+                let Some(func) = funcs.get(func.0.as_str()) else {
                     dbg_println!("TRYING TO CALL UNRESOLVED FUNCTION: {func:?}");
                     bu.ins().trap(TrapCode::unwrap_user(67));
                     return;
                 };
 
-                let func = calleemap[&func.id];
+                let func = calleemap[func];
 
                 flush(&mut tmp, bu);
                 let final_stack = bu.use_var(stack);
@@ -253,6 +249,14 @@ fn compile_block(
                 //     bu.ins().return_call(*func, &[final_stack]);
                 //     return;
                 // }
+
+                // TAIL CALL OPTIMIZATION
+                if i == line.len() - 1
+                    && let analysis::Terminator::Jump(analysis::Next::Terminate) = block.terminator
+                {
+                    bu.ins().return_call(func, &[final_stack]);
+                    return;
+                }
 
                 let ret = bu.ins().call(func, &[final_stack]);
                 // update stack
@@ -378,7 +382,6 @@ fn compile_block(
     }
 
     // build terminator
-
     let mut build_return = |bu: &mut FunctionBuilder, next: &analysis::Next| {
         flush(&mut tmp, bu);
         match next {
@@ -429,7 +432,7 @@ fn compile_block(
     }
 }
 
-struct ImportRefs {
+pub(crate) struct ImportRefs {
     printfunc: FuncRef,
     quitfunc: FuncRef,
     errorfunc: FuncRef,
@@ -457,50 +460,56 @@ fn generate_clac_function_signature(isa: &dyn TargetIsa, callconv: CallConv) -> 
     }
 }
 
-impl Compiler<JITModule> {
-    pub(crate) fn get_function(&self, func: FuncId) -> JITFunction {
-        unsafe { transmute_copy(&self.module.get_finalized_function(func)) }
-    }
+pub(crate) fn get_function(module: &JITModule, func: FuncId) -> JITFunction {
+    unsafe { transmute_copy(&module.get_finalized_function(func)) }
 }
+
+#[derive(Debug)]
+pub(crate) struct Callees(HashMap<FuncId, FuncRef>);
 
 impl<T: Module> Compiler<T> {
     pub(crate) fn generate_signature(&self, callconv: CallConv) -> Signature {
         generate_clac_function_signature(self.module.isa(), callconv)
     }
 
-    fn build_callee_map(
+    fn declare_callees(
         &mut self,
         line: &[types::Instr],
-        funcs: &types::FuncMap,
-    ) -> Result<HashMap<FuncId, FuncRef>, JITError> {
+        func: &mut cranelift::codegen::ir::Function,
+        funcs: &HashMap<&str, FuncId>,
+    ) -> Result<Callees, JITError> {
         let mut ret = HashMap::new();
 
         for instr in line {
             if let Instr::FunctionCall(funcref) = instr
-                && let Some(target) = funcs.lookup(funcref)
+                && let Some(&target) = funcs.get(funcref.0.as_str())
             {
-                let ClacFunction { id, .. } = target;
-                ret.insert(
-                    *id,
-                    self.module.declare_func_in_func(*id, &mut self.ctx.func),
-                );
+                ret.insert(target, self.module.declare_func_in_func(target, func));
             }
         }
 
-        Ok(ret)
+        Ok(Callees(ret))
     }
 
-    pub(crate) fn define_wrapper(&mut self, function: &ClacFunction) -> ModuleResult<()> {
-        self.module.clear_context(&mut self.ctx);
+    pub(crate) fn define_wrapper(
+        &mut self,
+        name: &str,
+        to_wrap: FuncId,
+        ctx: &mut cranelift::codegen::Context,
+        fbctx: &mut FunctionBuilderContext,
+    ) -> ModuleResult<FuncId> {
+        let sig = self.generate_signature(self.module.isa().default_call_conv());
 
-        // TODO: fix
-        self.ctx.func.signature = self.generate_signature(self.module.isa().default_call_conv());
+        let wrapper_id =
+            self.module
+                .declare_function(name, cranelift_module::Linkage::Export, &sig)?;
 
-        let target = self
-            .module
-            .declare_func_in_func(function.id, &mut self.ctx.func);
+        self.module.clear_context(ctx);
+        ctx.func.signature = sig;
 
-        let mut bu = FunctionBuilder::new(&mut self.ctx.func, &mut self.fbctx);
+        let target = self.module.declare_func_in_func(to_wrap, &mut ctx.func);
+
+        let mut bu = FunctionBuilder::new(&mut ctx.func, fbctx);
         let entry = bu.create_block();
         bu.switch_to_block(entry);
         bu.seal_block(entry);
@@ -515,49 +524,27 @@ impl<T: Module> Compiler<T> {
 
         bu.finalize();
 
-        self.module
-            .define_function(function.wrapper_id, &mut self.ctx)?;
+        self.module.define_function(wrapper_id, ctx)?;
 
-        Ok(())
+        Ok(wrapper_id)
     }
 
-    pub(crate) fn define_function(
-        &mut self,
-        function: &ClacFunction,
-        funcs: &types::FuncMap,
-    ) -> Result<(), CompilerError> {
-        self.module.clear_context(&mut self.ctx);
+    pub(crate) fn compile_function(
+        function: &[types::Instr],
+        mut ctx: cranelift::codegen::Context,
+        funcs: &HashMap<&str, FuncId>,
+        Callees(callees): Callees,
+        isa: &dyn TargetIsa,
+        refs: ImportRefs,
+    ) -> Result<cranelift::codegen::Context, CompilerError> {
+        let mut fbctx = FunctionBuilderContext::new();
 
         // TODO: fix when better function analysis is added
-        self.ctx.func.signature = self.generate_signature(CallConv::Tail);
-
-        let callees = self.build_callee_map(&function.code, funcs)?;
+        ctx.func.signature = generate_clac_function_signature(isa, CallConv::Tail);
         dbg_println!("Callees = {:?}", callees);
 
-        let types::Compiler {
-            ctx,
-            fbctx,
-            module,
-            imports:
-                types::Imports {
-                    printfunc,
-                    quitfunc,
-                    errorfunc,
-                    powfunc,
-                    syscallfunc,
-                },
-        } = self;
-
-        let refs = ImportRefs {
-            printfunc: module.declare_func_in_func(*printfunc, &mut ctx.func),
-            quitfunc: module.declare_func_in_func(*quitfunc, &mut ctx.func),
-            errorfunc: module.declare_func_in_func(*errorfunc, &mut ctx.func),
-            powfunc: module.declare_func_in_func(*powfunc, &mut ctx.func),
-            syscall: module.declare_func_in_func(*syscallfunc, &mut ctx.func),
-        };
-
-        let mut bu = FunctionBuilder::new(&mut ctx.func, fbctx);
-        let analyzed = analysis::create_graph(&function.code, &mut bu);
+        let mut bu = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
+        let analyzed = analysis::create_graph(function, &mut bu);
 
         let Some(entry) = analyzed.get(&0) else {
             let x = bu.create_block();
@@ -573,10 +560,9 @@ impl<T: Module> Compiler<T> {
 
             bu.finalize();
 
-            module.define_function(function.id, ctx)?;
             dbg_println!("compiled empty function");
 
-            return Ok(());
+            return Ok(ctx);
         };
 
         // dbg_println!("entry = {:?}", entry);
@@ -588,19 +574,19 @@ impl<T: Module> Compiler<T> {
 
         let stack = bu.block_params(cb)[0];
 
-        let stack_var = bu.declare_var(module.isa().pointer_type());
+        let stack_var = bu.declare_var(isa.pointer_type());
         bu.def_var(stack_var, stack);
 
         let stack = stack_var;
 
         let (trap_block, term_block) = (bu.create_block(), bu.create_block());
 
-        for (i, block) in analyzed {
+        for (_, block) in analyzed {
             compile_block(
                 block,
                 stack,
                 &mut bu,
-                module.isa(),
+                isa,
                 (funcs, &callees),
                 (trap_block, term_block),
                 &refs,
@@ -617,8 +603,6 @@ impl<T: Module> Compiler<T> {
         bu.ins().return_(&[stack_final]);
         bu.seal_block(term_block);
 
-        dbg_println!("Before tailcall IR: {}", bu.func.display());
-
         // TODO: tailcall?
         // if let Some((_, CraneliftedBlock(_, final_block))) = block_map.last_key_value() {
         //     // debug_assert!(final_block)
@@ -627,22 +611,11 @@ impl<T: Module> Compiler<T> {
 
         bu.finalize();
 
-        dbg_println!("Unoptimized IR: {}", ctx.func.display());
-
         if cfg!(feature = "debug") {
             ctx.set_disasm(true);
         }
 
-        module.define_function(function.id, ctx)?;
-
-        dbg_println!("Optimized IR: {}", ctx.func.display());
-
-        dbg_println!(
-            "disasm: {}",
-            ctx.compiled_code().unwrap().vcode.as_ref().unwrap()
-        );
-
-        Ok(())
+        Ok(ctx)
     }
 }
 
@@ -714,14 +687,92 @@ fn optimize_tailcall(func: &mut cranelift::codegen::ir::Function) {
 }
 
 impl<T: Module> Compiler<T> {
-    pub(crate) fn compile_functions_and_wrappers(
-        &mut self,
+    pub(crate) fn compile(
+        mut self,
         funcs: &types::FuncMap,
-    ) -> Result<(), CompilerError> {
-        for (_, function) in &funcs.0 {
-            self.define_function(&function, &funcs)?;
-            self.define_wrapper(&function)?;
+    ) -> Result<(T, HashMap<String, FuncId>), CompilerError> {
+        let tail = self.generate_signature(cranelift::prelude::isa::CallConv::Tail);
+
+        let types::Imports {
+            printfunc,
+            quitfunc,
+            powfunc,
+            syscallfunc,
+            errorfunc,
+        } = self.imports;
+
+        let declared: HashMap<&str, FuncId> = funcs
+            .iter()
+            .map(|(name, _)| {
+                (
+                    name.as_str(),
+                    self.module.declare_anonymous_function(&tail).unwrap(),
+                )
+            })
+            .collect();
+
+        let x: HashMap<
+            &str,
+            (
+                &[types::Instr],
+                cranelift::codegen::Context,
+                Callees,
+                ImportRefs,
+            ),
+        > = funcs
+            .iter()
+            .map(|(name, code)| {
+                let mut ctx = self.module.make_context();
+                let callees = self
+                    .declare_callees(code, &mut ctx.func, &declared)
+                    .unwrap();
+                let refs = ImportRefs {
+                    printfunc: self.module.declare_func_in_func(printfunc, &mut ctx.func),
+                    quitfunc: self.module.declare_func_in_func(quitfunc, &mut ctx.func),
+                    errorfunc: self.module.declare_func_in_func(errorfunc, &mut ctx.func),
+                    powfunc: self.module.declare_func_in_func(powfunc, &mut ctx.func),
+                    syscall: self.module.declare_func_in_func(syscallfunc, &mut ctx.func),
+                };
+                (name.as_str(), (code.as_slice(), ctx, callees, refs))
+            })
+            .collect();
+
+        let isa = self.module.isa();
+
+        let res: HashMap<_, _> = x
+            .into_par_iter()
+            .map(|(name, (code, ctx, callees, refs))| {
+                (
+                    name,
+                    Self::compile_function(code, ctx, &declared, callees, isa, refs).unwrap(),
+                )
+            })
+            .collect();
+
+        for (name, mut ctx) in res {
+            self.module
+                .define_function(*declared.get(name).unwrap(), &mut ctx)?;
+            dbg_println!("{name} IR: {}", ctx.func.display());
+
+            // dbg_println!(
+            //     "Disassembly of {name}: {}",
+            //     ctx.compiled_code().unwrap().vcode.as_ref().unwrap()
+            // );
         }
-        Ok(())
+
+        let mut ctx = self.module.make_context();
+        let mut fbctx = FunctionBuilderContext::new();
+
+        let out = declared
+            .into_iter()
+            .map(|(name, id)| {
+                (
+                    name.to_string(),
+                    self.define_wrapper(name, id, &mut ctx, &mut fbctx).unwrap(),
+                )
+            })
+            .collect();
+
+        Ok((self.module, out))
     }
 }

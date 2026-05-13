@@ -37,36 +37,36 @@ pub(crate) enum ArithOp {
 
 #[derive(Debug, Clone)]
 pub(crate) enum MemOp {
-    Read8,
-    ReadNative,
-    Write8,
-    WriteNative,
+    Read8,       // delta = 0, reach = 1
+    ReadNative,  // delta = 0, reach = 1
+    Write8,      // delta = -2, reach = 2
+    WriteNative, // delta = -2, reach = 2
 
-    WidthNative,
+    WidthNative, // delta = 1, reach = 0
 }
 
 #[derive(Debug, Clone)]
 // Internal clac instruction
 pub(crate) enum Instr {
     // data
-    Literal(Value),
-    FunctionCall(FuncRef),
+    Literal(Value),        // delta = 1, reach = 0
+    FunctionCall(FuncRef), // delta = -argc + return_count, reach = argc
 
     // side effects
-    Quit,
-    Print,
-    Syscall,
+    Quit,    // delta = anything, reach = 0
+    Print,   // delta = -1, reach = 1
+    Syscall, // delta = -6, reach = 7
 
     // stack manipulation
-    Drop,
-    Swap,
-    Rot,
-    DropRange,
-    Pick,
+    Drop,      // delta = -1, reach = 1
+    Swap,      // delta = 0
+    Rot,       // delta = 0
+    DropRange, // <start> <amt> drop_range => delta = -amt-2 , reach = start | else => INDETERMINATE
+    Pick,      // <amt> pick => delta = 1, reach = amt | else => INDETERMINATE
 
     // Math/Memory Instructions
-    Arith(ArithOp),
-    Mem(MemOp),
+    Arith(ArithOp), // delta = -1, reach = 2
+    Mem(MemOp),     // see `MemOp`
 
     // Control Flow
     If,

@@ -1,4 +1,4 @@
-use std::{mem::transmute_copy, rc::Rc};
+use std::{io::Write, mem::transmute_copy, rc::Rc};
 
 use crate::{
     jit::analysis::{self},
@@ -20,7 +20,8 @@ use cranelift::{
 };
 
 use cranelift_jit::JITModule;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use petgraph::Directed;
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use types::Value as ClacValue;
 
 use cranelift_module::{FuncId, Module, ModuleError, ModuleResult};
@@ -206,7 +207,6 @@ fn compile_block(
 
                 let n: usize = n.try_into().unwrap();
 
-                // TODO: improve
                 if n <= tmp.len() {
                     tmp.push(tmp[tmp.len() - n]);
                 } else {
@@ -463,6 +463,25 @@ pub(crate) fn get_function(module: &JITModule, func: FuncId) -> JITFunction {
 #[derive(Debug)]
 pub(crate) struct Callees(HashMap<FuncId, FuncRef>);
 
+fn get_callees<'a>(
+    line: &[types::Instr],
+    funcs: &HashMap<&'a str, FuncId>,
+) -> Vec<(&'a str, FuncId)> {
+    let mut ret = Vec::new();
+
+    for instr in line {
+        if let Instr::FunctionCall(funcref) = instr
+            && let Some((&name, &id)) = funcs.get_key_value(funcref.0.as_str())
+        {
+            debug_assert_eq!(name, funcref.0.as_str());
+
+            ret.push((name, id));
+        }
+    }
+
+    ret
+}
+
 impl<T: Module> Compiler<T> {
     pub(crate) fn generate_signature(&self, callconv: CallConv) -> Signature {
         generate_clac_function_signature(self.module.isa(), callconv)
@@ -470,21 +489,16 @@ impl<T: Module> Compiler<T> {
 
     fn declare_callees(
         &mut self,
-        line: &[types::Instr],
         func: &mut cranelift::codegen::ir::Function,
-        funcs: &HashMap<&str, FuncId>,
-    ) -> Result<Callees, JITError> {
+        callees: impl Iterator<Item = FuncId>,
+    ) -> Callees {
         let mut ret = HashMap::new();
 
-        for instr in line {
-            if let Instr::FunctionCall(funcref) = instr
-                && let Some(&target) = funcs.get(funcref.0.as_str())
-            {
-                ret.insert(target, self.module.declare_func_in_func(target, func));
-            }
+        for id in callees {
+            ret.insert(id, self.module.declare_func_in_func(id, func));
         }
 
-        Ok(Callees(ret))
+        Callees(ret)
     }
 
     pub(crate) fn define_wrapper(
@@ -633,6 +647,36 @@ impl<T: Module> Compiler<T> {
             })
             .collect();
 
+        let graph: petgraph::graphmap::GraphMap<&str, (), Directed> =
+            petgraph::graphmap::GraphMap::from_edges(
+                funcs
+                    .iter()
+                    .flat_map(|(name, code)| {
+                        get_callees(code, &declared)
+                            .into_iter()
+                            .map(|(callee, _)| (name.as_str(), callee))
+                    })
+                    .map(|(caller, callee)| (caller, callee, ())),
+            );
+
+        let x = petgraph::dot::Dot::with_config(&graph, &[]);
+        let out = format!("{:?}", x);
+        let mut file = std::fs::File::create("graph.dot").unwrap();
+        file.write_all(out.as_bytes()).unwrap();
+
+        dbg!(graph);
+
+        // todo!();
+
+        // : B ;
+        // : C A ;
+        // : A B C ;
+        //
+        // /-->A --> B
+        // |   |
+        // |   v
+        // \-- C
+
         let x: HashMap<
             &str,
             (
@@ -642,12 +686,17 @@ impl<T: Module> Compiler<T> {
                 ImportRefs,
             ),
         > = funcs
-            .iter()
-            .map(|(name, code)| {
+            .into_par_iter()
+            // TODO: since we do this, we can remove get_callees in Self::compile
+            .map(|(name, code)| (name, (code, get_callees(code, &declared))))
+            .collect::<HashMap<_, _>>()
+            .into_iter()
+            .map(|(name, (code, callees))| {
                 let mut ctx = self.module.make_context();
-                let callees = self
-                    .declare_callees(code, &mut ctx.func, &declared)
-                    .unwrap();
+
+                let callees =
+                    self.declare_callees(&mut ctx.func, callees.into_iter().map(|(_, id)| id));
+
                 let refs = ImportRefs {
                     printfunc: self.module.declare_func_in_func(printfunc, &mut ctx.func),
                     quitfunc: self.module.declare_func_in_func(quitfunc, &mut ctx.func),

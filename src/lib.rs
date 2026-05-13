@@ -182,6 +182,11 @@ impl ClacState {
             }
             Instr::Pick => {
                 let conv: usize = xpop()?.try_into().map_err(|_| ExecError::InvalidPick)?;
+
+                let true = conv > 0 else {
+                    return Err(ExecError::InvalidPick);
+                };
+
                 let val = stack.rsp.wrapping_sub(conv);
 
                 // TODO: undefined behavior for invalid picks?

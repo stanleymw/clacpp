@@ -4,7 +4,7 @@ use crate::{
     jit::analysis::{self},
     types::{self, ArithOp, CRANELIFT_VALUE, Compiler, Instr, JITFunction, MemOp},
 };
-use ahash::{HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use cranelift::{
     codegen::{
         control::ControlPlane,
@@ -20,7 +20,7 @@ use cranelift::{
 };
 
 use cranelift_jit::JITModule;
-use petgraph::Directed;
+use petgraph::{Directed, visit::Walker};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use types::Value as ClacValue;
 
@@ -207,6 +207,9 @@ fn compile_block(
 
                 let n: usize = n.try_into().unwrap();
 
+                // TODO: turn this into trap otherwise
+                assert!(n > 0);
+
                 if n <= tmp.len() {
                     tmp.push(tmp[tmp.len() - n]);
                 } else {
@@ -307,6 +310,8 @@ fn compile_block(
                 // bu.emit_small_memory_copy( config, dest, src, size, dest_align, src_align, non_overlapping, flags, );
 
                 assert!(amount >= 0);
+                // TODO: make this a trap instead
+                // test case: 1 2 3 4 5   3 5 drop_range
                 assert!(start >= amount);
 
                 let keep: usize = (start - amount).try_into().unwrap();
@@ -466,8 +471,8 @@ pub(crate) struct Callees(HashMap<FuncId, FuncRef>);
 fn get_callees<'a>(
     line: &[types::Instr],
     funcs: &HashMap<&'a str, FuncId>,
-) -> Vec<(&'a str, FuncId)> {
-    let mut ret = Vec::new();
+) -> HashSet<(&'a str, FuncId)> {
+    let mut ret = HashSet::new();
 
     for instr in line {
         if let Instr::FunctionCall(funcref) = instr
@@ -475,7 +480,7 @@ fn get_callees<'a>(
         {
             debug_assert_eq!(name, funcref.0.as_str());
 
-            ret.push((name, id));
+            ret.insert((name, id));
         }
     }
 
@@ -647,26 +652,35 @@ impl<T: Module> Compiler<T> {
             })
             .collect();
 
-        let graph: petgraph::graphmap::GraphMap<&str, (), Directed> =
-            petgraph::graphmap::GraphMap::from_edges(
-                funcs
-                    .iter()
-                    .flat_map(|(name, code)| {
-                        get_callees(code, &declared)
-                            .into_iter()
-                            .map(|(callee, _)| (name.as_str(), callee))
-                    })
-                    .map(|(caller, callee)| (caller, callee, ())),
-            );
+        let mut graph: petgraph::Graph<&str, ()> = petgraph::Graph::new();
+        let nodes: HashMap<_, _> = funcs
+            .iter()
+            .map(|(name, _)| (name.as_str(), graph.add_node(name.as_str())))
+            .collect();
+
+        // add edges
+        funcs
+            .iter()
+            .flat_map(|(name, code)| {
+                get_callees(code, &declared)
+                    .into_iter()
+                    .map(|(callee, _)| (name.as_str(), callee))
+            })
+            .map(|(caller, callee)| (*nodes.get(callee).unwrap(), *nodes.get(caller).unwrap(), ()))
+            .for_each(|(a, b, c)| {
+                graph.add_edge(a, b, c);
+            });
+
+        let graph = petgraph::algo::condensation(graph, true);
+
+        analysis::recover_function_signatures(&graph);
 
         let x = petgraph::dot::Dot::with_config(&graph, &[]);
         let out = format!("{:?}", x);
         let mut file = std::fs::File::create("graph.dot").unwrap();
         file.write_all(out.as_bytes()).unwrap();
 
-        dbg!(graph);
-
-        // todo!();
+        todo!();
 
         // : B ;
         // : C A ;

@@ -45,6 +45,9 @@ pub(crate) enum MemOp {
     WidthNative, // delta = 1, reach = 0
 }
 
+// Theorem:
+// total delta >= -(peak reach)
+
 #[derive(Debug, Clone)]
 // Internal clac instruction
 pub(crate) enum Instr {
@@ -53,16 +56,20 @@ pub(crate) enum Instr {
     FunctionCall(FuncRef), // delta = -argc + return_count, reach = argc
 
     // side effects
-    Quit,    // delta = anything, reach = 0
+    Quit,    // delta = !, reach = 0
     Print,   // delta = -1, reach = 1
     Syscall, // delta = -6, reach = 7
 
     // stack manipulation
-    Drop,      // delta = -1, reach = 1
-    Swap,      // delta = 0
-    Rot,       // delta = 0
-    DropRange, // <start> <amt> drop_range => delta = -amt-2 , reach = start | else => INDETERMINATE
-    Pick,      // <amt> pick => delta = 1, reach = amt | else => INDETERMINATE
+    Drop, // delta = -1, reach = 1
+    Swap, // delta = 0, reach = 2
+    Rot,  // delta = 0, reach = 3
+
+    // PRECONDITION: start >= amt
+    DropRange, // <start> <amt> drop_range => delta = -amt-2 , reach = start+2 | else => INDETERMINATE
+
+    // PRECONDITION: amt >= 1
+    Pick, // <amt> pick => delta = 1, reach = amt | else => INDETERMINATE
 
     // Math/Memory Instructions
     Arith(ArithOp), // delta = -1, reach = 2

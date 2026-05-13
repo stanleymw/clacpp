@@ -3,6 +3,8 @@ use std::{
     rc::Rc,
 };
 
+use ahash::{HashMap, HashMapExt};
+
 use crate::types::{self, Instr};
 
 #[derive(Debug)]
@@ -108,6 +110,25 @@ fn get_block_breaks_v2(func: &[types::Instr]) -> BTreeSet<usize> {
 //     });
 // }
 
+pub(crate) struct ResolvedSig {}
+
+pub(crate) fn recover_function_signatures<'a>(
+    graph: &petgraph::Graph<Vec<&'a str>, ()>,
+) -> HashMap<&'a str, ResolvedSig> {
+    let resolved = HashMap::new();
+
+    let sort = petgraph::algo::toposort(graph, None)
+        .expect("graph should not have any cycles. Make sure it is condensed");
+
+    for scc in sort {
+        let scc = &graph[scc];
+
+        // set up Z3 solver for this scc
+    }
+
+    resolved
+}
+
 pub(crate) fn create_graph<'inst>(
     func: &'inst [types::Instr],
     bu: &mut cranelift::prelude::FunctionBuilder,
@@ -151,33 +172,28 @@ pub(crate) fn create_graph<'inst>(
     for (start, code) in basic_blocks.into_iter().rev() {
         let (last, begin) = code.split_last().expect("basic_block.len() >= 1");
 
-        match last {
-            Instr::If => {
-                let new = Block {
+        out.insert(
+            start,
+            Rc::new(match last {
+                Instr::If => Block {
                     code: begin.try_into().unwrap(),
                     cranelift_block: bu.create_block(),
                     terminator: Terminator::If {
                         on_true: get_next(&out, start + code.len()),
                         on_false: get_next(&out, start + code.len() + 3),
                     },
-                };
-
-                out.insert(start, Rc::new(new));
-            }
-            Instr::Skip
-                if let Some((Instr::Literal(amt), begin2)) = begin.split_last()
-                    && let Ok(conv) = usize::try_from(*amt) =>
-            {
-                let new = Block {
-                    code: begin2.try_into().unwrap(),
-                    cranelift_block: bu.create_block(),
-                    terminator: Terminator::Jump(get_next(&out, start + code.len() + conv)),
-                };
-
-                out.insert(start, Rc::new(new));
-            }
-            Instr::Skip => {
-                let new = Block {
+                },
+                Instr::Skip
+                    if let Some((Instr::Literal(amt), begin2)) = begin.split_last()
+                        && let Ok(conv) = usize::try_from(*amt) =>
+                {
+                    Block {
+                        code: begin2.try_into().unwrap(),
+                        cranelift_block: bu.create_block(),
+                        terminator: Terminator::Jump(get_next(&out, start + code.len() + conv)),
+                    }
+                }
+                Instr::Skip => Block {
                     code: begin.try_into().unwrap(),
                     cranelift_block: bu.create_block(),
                     terminator: Terminator::Skip {
@@ -185,20 +201,14 @@ pub(crate) fn create_graph<'inst>(
                             .map(|val| get_next(&out, val))
                             .collect(),
                     },
-                };
-
-                out.insert(start, Rc::new(new));
-            }
-            _ => {
-                let new = Block {
+                },
+                _ => Block {
                     code: code.try_into().unwrap(),
                     cranelift_block: bu.create_block(),
                     terminator: Terminator::Jump(get_next(&out, start + code.len())),
-                };
-
-                out.insert(start, Rc::new(new));
-            }
-        };
+                },
+            }),
+        );
     }
 
     out

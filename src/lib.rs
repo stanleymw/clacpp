@@ -48,182 +48,215 @@ impl ClacState {
         let mut xpop = || stack.pop().ok_or(ExecError::MissingArguments);
 
         match token {
-            Instr::Literal(n) => {
-                stack.push(*n);
-                Ok(ExecRes::Executed)
-            }
-            Instr::Quit => Err(ExecError::Quit),
-            Instr::FunctionCall(state) => {
-                let Some((module, map)) = jit else {
-                    panic!("No JIT")
-                };
-
-                let Some(f) = map.get(&state.0) else {
-                    return Err(ExecError::UnknownFunction(state.0.to_string()));
-                };
-
-                let asm = get_function(module, *f);
-
-                let new_rsp = unsafe { asm(stack.rsp) };
-                stack.rsp = new_rsp;
-
-                Ok(ExecRes::Executed)
-            }
-
-            Instr::Print => {
-                println!("{}", xpop()?);
-                Ok(ExecRes::Executed)
-            }
-            Instr::Drop => {
-                xpop()?;
-                Ok(ExecRes::Executed)
-            }
-            Instr::Swap => {
-                let b = xpop()?;
-                let a = xpop()?;
-
-                stack.push(b);
-                stack.push(a);
-
-                Ok(ExecRes::Executed)
-            }
-            Instr::Rot => {
-                let z = xpop()?;
-                let y = xpop()?;
-                let x = xpop()?;
-
-                stack.push(y);
-                stack.push(z);
-                stack.push(x);
-                Ok(ExecRes::Executed)
-            }
-            Instr::If => match xpop()? {
-                0 => Ok(ExecRes::Skip(3)),
-                _ => Ok(ExecRes::Executed),
+            Instr::CFInstr(x) => match x {
+                ControlFlowInstr::If => match xpop()? {
+                    0 => Ok(ExecRes::Skip(3)),
+                    _ => Ok(ExecRes::Executed),
+                },
+                ControlFlowInstr::Skip => Ok(ExecRes::Skip(
+                    xpop()?.try_into().map_err(|_| ExecError::InvalidSkip)?,
+                )),
             },
-            Instr::Skip => Ok(ExecRes::Skip(
-                xpop()?.try_into().map_err(|_| ExecError::InvalidSkip)?,
-            )),
-            Instr::Arith(it) => {
-                let b = xpop()?;
-                let a = xpop()?;
-                stack.push(match it {
-                    ArithOp::Add => a + b,
-                    ArithOp::Sub => a - b,
-                    ArithOp::Mul => a * b,
-                    ArithOp::Div => a / b,
-                    ArithOp::Rem => a % b,
-                    ArithOp::Lt => {
-                        if a < b {
-                            1
-                        } else {
-                            0
+            Instr::BBInstr(x) => match x {
+                BasicBlockInstr::Literal(n) => {
+                    stack.push(*n);
+                    Ok(ExecRes::Executed)
+                }
+                BasicBlockInstr::Quit => Err(ExecError::Quit),
+                BasicBlockInstr::FunctionCall(state) => {
+                    let Some((module, map)) = jit else {
+                        panic!("No JIT")
+                    };
+
+                    let Some(f) = map.get(state) else {
+                        return Err(ExecError::UnknownFunction(state.to_string()));
+                    };
+
+                    let asm = get_function(module, *f);
+
+                    let new_rsp = unsafe { asm(stack.rsp) };
+                    stack.rsp = new_rsp;
+
+                    Ok(ExecRes::Executed)
+                }
+
+                BasicBlockInstr::Print => {
+                    println!("{}", xpop()?);
+                    Ok(ExecRes::Executed)
+                }
+                BasicBlockInstr::Drop => {
+                    xpop()?;
+                    Ok(ExecRes::Executed)
+                }
+                BasicBlockInstr::Swap => {
+                    let b = xpop()?;
+                    let a = xpop()?;
+
+                    stack.push(b);
+                    stack.push(a);
+
+                    Ok(ExecRes::Executed)
+                }
+                BasicBlockInstr::Rot => {
+                    let z = xpop()?;
+                    let y = xpop()?;
+                    let x = xpop()?;
+
+                    stack.push(y);
+                    stack.push(z);
+                    stack.push(x);
+                    Ok(ExecRes::Executed)
+                }
+                BasicBlockInstr::Arith(it) => {
+                    let b = xpop()?;
+                    let a = xpop()?;
+                    stack.push(match it {
+                        ArithOp::Add => a + b,
+                        ArithOp::Sub => a - b,
+                        ArithOp::Mul => a * b,
+                        ArithOp::Div => a / b,
+                        ArithOp::Rem => a % b,
+                        ArithOp::Lt => {
+                            if a < b {
+                                1
+                            } else {
+                                0
+                            }
                         }
-                    }
-                    ArithOp::Pow => builtins::pow(a, b).ok_or(ExecError::InvalidExponent)?,
-                });
-                Ok(ExecRes::Executed)
-            }
-            Instr::Mem(memop) => {
-                match memop {
-                    MemOp::Read8 => {
-                        let addr = xpop()?;
-                        let val = (unsafe { *(addr as *const u8) }) as Value;
-                        stack.push(val);
-                    }
-
-                    MemOp::Write8 => {
-                        let value: u8 = xpop()?
-                            .try_into()
-                            .expect("trying to write8 on a value that doesn't fit in a byte");
-
-                        let addr = xpop()?;
-
-                        let ptr = addr as *mut u8;
-                        unsafe {
-                            *ptr = value;
+                        ArithOp::Pow => builtins::pow(a, b).ok_or(ExecError::InvalidExponent)?,
+                    });
+                    Ok(ExecRes::Executed)
+                }
+                BasicBlockInstr::Mem(memop) => {
+                    match memop {
+                        MemOp::Read8 => {
+                            let addr = xpop()?;
+                            let val = (unsafe { *(addr as *const u8) }) as Value;
+                            stack.push(val);
                         }
-                    }
 
-                    MemOp::ReadNative => {
-                        let addr = xpop()?;
-                        let val = (unsafe { *(addr as *const Value) }) as Value;
-                        stack.push(val);
-                    }
+                        MemOp::Write8 => {
+                            let value: u8 = xpop()?
+                                .try_into()
+                                .expect("trying to write8 on a value that doesn't fit in a byte");
 
-                    MemOp::WriteNative => {
-                        let value: Value = xpop()?;
-                        let addr = xpop()?;
+                            let addr = xpop()?;
 
-                        let ptr = addr as *mut Value;
-                        unsafe {
-                            *ptr = value;
+                            let ptr = addr as *mut u8;
+                            unsafe {
+                                *ptr = value;
+                            }
                         }
-                    }
 
-                    MemOp::WidthNative => {
-                        stack.push(Value::BITS.into());
-                    }
-                };
-                Ok(ExecRes::Executed)
-            }
-            Instr::Syscall => {
-                let v6 = xpop()?;
-                let v5 = xpop()?;
-                let v4 = xpop()?;
-                let v3 = xpop()?;
-                let v2 = xpop()?;
-                let v1 = xpop()?;
-                let rax = xpop()?;
+                        MemOp::ReadNative => {
+                            let addr = xpop()?;
+                            let val = (unsafe { *(addr as *const Value) }) as Value;
+                            stack.push(val);
+                        }
 
-                stack.push(unsafe { builtins::syscall(rax, v1, v2, v3, v4, v5, v6) });
+                        MemOp::WriteNative => {
+                            let value: Value = xpop()?;
+                            let addr = xpop()?;
 
-                Ok(ExecRes::Executed)
-            }
-            Instr::Pick => {
-                let conv: usize = xpop()?.try_into().map_err(|_| ExecError::InvalidPick)?;
+                            let ptr = addr as *mut Value;
+                            unsafe {
+                                *ptr = value;
+                            }
+                        }
 
-                let true = conv > 0 else {
-                    return Err(ExecError::InvalidPick);
-                };
+                        MemOp::WidthNative => {
+                            stack.push(Value::BITS.into());
+                        }
+                    };
+                    Ok(ExecRes::Executed)
+                }
+                BasicBlockInstr::Syscall => {
+                    let v6 = xpop()?;
+                    let v5 = xpop()?;
+                    let v4 = xpop()?;
+                    let v3 = xpop()?;
+                    let v2 = xpop()?;
+                    let v1 = xpop()?;
+                    let rax = xpop()?;
 
-                let val = stack.rsp.wrapping_sub(conv);
+                    stack.push(unsafe { builtins::syscall(rax, v1, v2, v3, v4, v5, v6) });
 
-                // TODO: undefined behavior for invalid picks?
-                stack.push(unsafe { *val });
+                    Ok(ExecRes::Executed)
+                }
 
-                Ok(ExecRes::Executed)
-            }
-            Instr::DropRange => {
-                let amount: usize = xpop()?
-                    .try_into()
-                    .map_err(|_| ExecError::InvalidDropRange)?;
-                let start: usize = xpop()?
-                    .try_into()
-                    .map_err(|_| ExecError::InvalidDropRange)?;
+                BasicBlockInstr::ResolvedPick(n) => {
+                    let val = stack.rsp.wrapping_sub(*n);
 
-                let true = amount <= start else {
-                    return Err(ExecError::InvalidDropRange);
-                };
+                    // TODO: undefined behavior for invalid picks?
+                    stack.push(unsafe { *val });
 
-                let drop_start = stack.rsp.wrapping_sub(start);
+                    Ok(ExecRes::Executed)
+                }
+                BasicBlockInstr::BadPick => {
+                    let conv: usize = xpop()?.try_into().map_err(|_| ExecError::InvalidPick)?;
 
-                let drop_end = drop_start.wrapping_add(amount);
+                    let true = conv > 0 else {
+                        return Err(ExecError::InvalidPick);
+                    };
 
-                debug_assert!(stack.rsp >= drop_end);
+                    let val = stack.rsp.wrapping_sub(conv);
 
-                let keep_amount = start - amount;
-                debug_assert_eq!(
-                    unsafe { stack.rsp.offset_from_unsigned(drop_end) },
-                    keep_amount
-                );
+                    // TODO: undefined behavior for invalid picks?
+                    stack.push(unsafe { *val });
 
-                unsafe { std::ptr::copy(drop_end, drop_start, keep_amount) };
+                    Ok(ExecRes::Executed)
+                }
 
-                stack.rsp = stack.rsp.wrapping_sub(amount);
+                &BasicBlockInstr::ResolvedDropRange { start, amt: amount } => {
+                    let drop_start = stack.rsp.wrapping_sub(start);
 
-                Ok(ExecRes::Executed)
-            }
+                    let drop_end = drop_start.wrapping_add(amount);
+
+                    debug_assert!(stack.rsp >= drop_end);
+
+                    let keep_amount = start - amount;
+                    debug_assert_eq!(
+                        unsafe { stack.rsp.offset_from_unsigned(drop_end) },
+                        keep_amount
+                    );
+
+                    unsafe { std::ptr::copy(drop_end, drop_start, keep_amount) };
+
+                    stack.rsp = stack.rsp.wrapping_sub(amount);
+
+                    Ok(ExecRes::Executed)
+                }
+                BasicBlockInstr::BadDropRange => {
+                    let amount: usize = xpop()?
+                        .try_into()
+                        .map_err(|_| ExecError::InvalidDropRange)?;
+                    let start: usize = xpop()?
+                        .try_into()
+                        .map_err(|_| ExecError::InvalidDropRange)?;
+
+                    let true = amount <= start else {
+                        return Err(ExecError::InvalidDropRange);
+                    };
+
+                    let drop_start = stack.rsp.wrapping_sub(start);
+
+                    let drop_end = drop_start.wrapping_add(amount);
+
+                    debug_assert!(stack.rsp >= drop_end);
+
+                    let keep_amount = start - amount;
+                    debug_assert_eq!(
+                        unsafe { stack.rsp.offset_from_unsigned(drop_end) },
+                        keep_amount
+                    );
+
+                    unsafe { std::ptr::copy(drop_end, drop_start, keep_amount) };
+
+                    stack.rsp = stack.rsp.wrapping_sub(amount);
+
+                    Ok(ExecRes::Executed)
+                }
+            },
         }
     }
 
@@ -241,8 +274,11 @@ impl ClacState {
 
             let mut optimize_push = |vals: &[Instr]| match vals {
                 [] => {}
-                [Instr::Literal(n), Instr::Skip, rest @ ..]
-                    if (*n >= 0 && ((*n as usize) == rest.len())) => {}
+                [
+                    Instr::BBInstr(BasicBlockInstr::Literal(n)),
+                    Instr::CFInstr(ControlFlowInstr::Skip),
+                    rest @ ..,
+                ] if (*n >= 0 && ((*n as usize) == rest.len())) => {}
                 _ => {
                     callstack.push(xs);
                 }

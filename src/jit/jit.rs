@@ -2,7 +2,7 @@ use std::{io::Write, mem::transmute_copy, rc::Rc};
 
 use crate::{
     jit::analysis::{self},
-    types::{self, ArithOp, CRANELIFT_VALUE, Compiler, Instr, JITFunction, MemOp},
+    types::{self, ArithOp, BasicBlockInstr, CRANELIFT_VALUE, Compiler, Instr, JITFunction, MemOp},
 };
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use cranelift::{
@@ -92,7 +92,8 @@ fn compile_block(
 ) {
     // dbg_println!("compiling block = {:?}", block);
 
-    let cb = block.cranelift_block;
+    // let cb = block.cranelift_block;
+    let cb = todo!();
     bu.switch_to_block(cb);
     bu.seal_block(cb);
 
@@ -143,17 +144,15 @@ fn compile_block(
             Some(num.into())
         };
 
-    let line = block.code.0;
+    let line = block.code;
 
     for (i, inst) in line.iter().enumerate() {
-        use types::Instr;
-
         match inst {
-            Instr::Literal(n) => {
+            BasicBlockInstr::Literal(n) => {
                 let out = bu.ins().iconst(I64, *n);
                 tmp.push(out);
             }
-            Instr::Arith(it) => {
+            BasicBlockInstr::Arith(it) => {
                 let b = xpop(&mut tmp, bu);
                 let a = xpop(&mut tmp, bu);
 
@@ -173,14 +172,14 @@ fn compile_block(
                     }
                 });
             }
-            Instr::Swap => {
+            BasicBlockInstr::Swap => {
                 let b = xpop(&mut tmp, bu);
                 let a = xpop(&mut tmp, bu);
 
                 tmp.push(b);
                 tmp.push(a);
             }
-            Instr::Rot => {
+            BasicBlockInstr::Rot => {
                 let z = xpop(&mut tmp, bu);
                 let y = xpop(&mut tmp, bu);
                 let x = xpop(&mut tmp, bu);
@@ -189,23 +188,20 @@ fn compile_block(
                 tmp.push(z);
                 tmp.push(x);
             }
-            Instr::Drop => {
+            BasicBlockInstr::Drop => {
                 xpop_no_value(&mut tmp, bu);
             }
-            Instr::Print => {
+            BasicBlockInstr::Print => {
                 let popped = xpop(&mut tmp, bu);
                 bu.ins().call(refs.printfunc, &[popped]);
             }
-            Instr::Quit => {
+            BasicBlockInstr::Quit => {
                 bu.ins().call(refs.quitfunc, &[]);
             }
-            Instr::Pick
-                if i > 0
-                    && let Some(&Instr::Literal(n)) = line.get(i - 1) =>
-            {
-                assert_eq!(value_to_const(bu.func, tmp.pop().unwrap()).unwrap(), n);
+            &BasicBlockInstr::ResolvedPick(n) => {
+                // assert_eq!(value_to_const(bu.func, tmp.pop().unwrap()).unwrap(), n);
 
-                let n: usize = n.try_into().unwrap();
+                // let n: usize = n.try_into().unwrap();
 
                 // TODO: turn this into trap otherwise
                 assert!(n > 0);
@@ -223,7 +219,7 @@ fn compile_block(
                     tmp.push(loaded);
                 }
             }
-            Instr::Pick => {
+            BasicBlockInstr::BadPick => {
                 let popped = xpop(&mut tmp, bu);
 
                 // TODO: improve
@@ -231,11 +227,8 @@ fn compile_block(
 
                 emit_pick(bu, stack, popped);
             }
-            Instr::If | Instr::Skip => {
-                unreachable!("There should not be any control flow in this code")
-            }
-            Instr::FunctionCall(func) => {
-                let Some(func) = funcs.get(func.0.as_str()) else {
+            BasicBlockInstr::FunctionCall(func) => {
+                let Some(func) = funcs.get(func.as_str()) else {
                     dbg_println!("TRYING TO CALL UNRESOLVED FUNCTION: {func:?}");
                     bu.ins().trap(TrapCode::unwrap_user(67));
                     return;
@@ -264,7 +257,7 @@ fn compile_block(
                 let ret = bu.inst_results(ret)[0];
                 bu.def_var(stack, ret);
             }
-            Instr::Mem(memop) => {
+            BasicBlockInstr::Mem(memop) => {
                 match memop {
                     MemOp::Read8 => {
                         let addr = xpop(&mut tmp, bu);
@@ -299,29 +292,26 @@ fn compile_block(
                 };
             }
             // TODO: optimize by special casing on compile time known ranges
-            Instr::DropRange
-                if i >= 2
-                    && let &[Instr::Literal(start), Instr::Literal(amount)] = &line[i - 2..i] =>
-            {
-                assert_eq!(value_to_const(bu.func, tmp.pop().unwrap()).unwrap(), amount);
+            &BasicBlockInstr::ResolvedDropRange { start, amt } => {
+                // assert_eq!(value_to_const(bu.func, tmp.pop().unwrap()).unwrap(), amount);
 
-                assert_eq!(value_to_const(bu.func, tmp.pop().unwrap()).unwrap(), start);
+                // assert_eq!(value_to_const(bu.func, tmp.pop().unwrap()).unwrap(), start);
 
                 // bu.emit_small_memory_copy( config, dest, src, size, dest_align, src_align, non_overlapping, flags, );
 
-                assert!(amount >= 0);
+                assert!(amt >= 0);
                 // TODO: make this a trap instead
                 // test case: 1 2 3 4 5   3 5 drop_range
-                assert!(start >= amount);
+                assert!(start >= amt);
 
-                let keep: usize = (start - amount).try_into().unwrap();
+                let keep: usize = (start - amt).try_into().unwrap();
                 let mut out = Vec::with_capacity(keep);
 
                 for _ in 0..keep {
                     out.push(xpop(&mut tmp, bu));
                 }
 
-                for _ in 0..amount {
+                for _ in 0..amt {
                     xpop_no_value(&mut tmp, bu);
                 }
 
@@ -329,7 +319,7 @@ fn compile_block(
                     tmp.push(x);
                 }
             }
-            Instr::DropRange => {
+            BasicBlockInstr::BadDropRange => {
                 let amount = xpop(&mut tmp, bu);
                 let start = xpop(&mut tmp, bu);
 
@@ -368,7 +358,7 @@ fn compile_block(
                 let new_rsp = bu.ins().isub(rsp, amount_strided);
                 bu.def_var(stack, new_rsp);
             }
-            Instr::Syscall => {
+            BasicBlockInstr::Syscall => {
                 let v6 = xpop(&mut tmp, bu);
                 let v5 = xpop(&mut tmp, bu);
                 let v4 = xpop(&mut tmp, bu);
@@ -396,7 +386,8 @@ fn compile_block(
                 bu.ins().return_(&[final_stack]);
             }
             analysis::Next::Block(block) => {
-                bu.ins().jump(block.cranelift_block, &[]);
+                // bu.ins().jump(block.cranelift_block, &[]);
+                bu.ins().jump(todo!(), &[]);
             }
         }
     };
@@ -404,7 +395,8 @@ fn compile_block(
     let get_block = |next: &analysis::Next| match next {
         analysis::Next::Trap => trap_block,
         analysis::Next::Terminate => term_block,
-        analysis::Next::Block(block) => block.cranelift_block,
+        // analysis::Next::Block(block) => block.cranelift_block,
+        analysis::Next::Block(block) => todo!(),
     };
 
     match &block.terminator {
@@ -475,10 +467,10 @@ fn get_callees<'a>(
     let mut ret = HashSet::new();
 
     for instr in line {
-        if let Instr::FunctionCall(funcref) = instr
-            && let Some((&name, &id)) = funcs.get_key_value(funcref.0.as_str())
+        if let Instr::BBInstr(BasicBlockInstr::FunctionCall(funcref)) = instr
+            && let Some((&name, &id)) = funcs.get_key_value(funcref.as_str())
         {
-            debug_assert_eq!(name, funcref.0.as_str());
+            debug_assert_eq!(name, funcref.as_str());
 
             ret.insert((name, id));
         }
@@ -563,7 +555,8 @@ impl<T: Module> Compiler<T> {
         dbg_println!("Callees = {:?}", callees);
 
         let mut bu = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
-        let analyzed = analysis::create_graph(function, &mut bu);
+        // let analyzed = analysis::create_graph(function, &mut bu);
+        let analyzed: HashMap<usize, _> = todo!();
 
         let Some(entry) = analyzed.get(&0) else {
             let x = bu.create_block();
@@ -586,7 +579,8 @@ impl<T: Module> Compiler<T> {
 
         // dbg_println!("entry = {:?}", entry);
 
-        let cb = entry.cranelift_block;
+        // let cb = entry.cranelift_block;
+        let cb = todo!();
 
         bu.append_block_params_for_function_params(cb);
         bu.switch_to_block(cb);
@@ -666,14 +660,20 @@ impl<T: Module> Compiler<T> {
                     .into_iter()
                     .map(|(callee, _)| (name.as_str(), callee))
             })
-            .map(|(caller, callee)| (*nodes.get(callee).unwrap(), *nodes.get(caller).unwrap(), ()))
+            .map(|(caller, callee)| (nodes[callee], nodes[caller], ()))
             .for_each(|(a, b, c)| {
                 graph.add_edge(a, b, c);
             });
 
         let graph = petgraph::algo::condensation(graph, true);
 
-        analysis::recover_function_signatures(&graph);
+        // TODO: fix this
+        let funcs2 = funcs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_slice()))
+            .collect();
+
+        analysis::analyze(&graph, &funcs2);
 
         let x = petgraph::dot::Dot::with_config(&graph, &[]);
         let out = format!("{:?}", x);

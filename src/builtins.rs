@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use ahash::AHashMap;
 
-use crate::types::{ArithOp, Instr, MemOp, Value};
+use crate::types::{ArithOp, BasicBlockInstr, Instr, MemOp, Value};
 
 pub(crate) unsafe extern "C" fn syscall(
     n: Value,
@@ -33,22 +33,31 @@ pub(crate) fn pow(x: Value, y: Value) -> Option<Value> {
 pub static FUNCTIONS: LazyLock<AHashMap<&str, Instr>> = LazyLock::new(|| {
     AHashMap::from([
         // arith
-        ("+", Instr::Arith(ArithOp::Add)),
-        ("-", Instr::Arith(ArithOp::Sub)),
-        ("*", Instr::Arith(ArithOp::Mul)),
-        ("/", Instr::Arith(ArithOp::Div)),
-        ("%", Instr::Arith(ArithOp::Rem)),
-        ("<", Instr::Arith(ArithOp::Lt)),
-        ("**", Instr::Arith(ArithOp::Pow)),
+        ("+", BasicBlockInstr::Arith(ArithOp::Add).into()),
+        ("-", BasicBlockInstr::Arith(ArithOp::Sub).into()),
+        ("*", BasicBlockInstr::Arith(ArithOp::Mul).into()),
+        ("/", BasicBlockInstr::Arith(ArithOp::Div).into()),
+        ("%", BasicBlockInstr::Arith(ArithOp::Rem).into()),
+        ("<", BasicBlockInstr::Arith(ArithOp::Lt).into()),
+        ("**", BasicBlockInstr::Arith(ArithOp::Pow).into()),
         // mem
-        ("read8", Instr::Mem(MemOp::Read8)),
-        ("write8", Instr::Mem(MemOp::Write8)),
-        ("read_native", Instr::Mem(MemOp::ReadNative)),
-        ("write_native", Instr::Mem(MemOp::WriteNative)),
-        ("width_native", Instr::Mem(MemOp::WidthNative)),
+        ("read8", BasicBlockInstr::Mem(MemOp::Read8).into()),
+        ("write8", BasicBlockInstr::Mem(MemOp::Write8).into()),
+        (
+            "read_native",
+            BasicBlockInstr::Mem(MemOp::ReadNative).into(),
+        ),
+        (
+            "write_native",
+            BasicBlockInstr::Mem(MemOp::WriteNative).into(),
+        ),
+        (
+            "width_native",
+            BasicBlockInstr::Mem(MemOp::WidthNative).into(),
+        ),
         // side effects
-        ("syscall", Instr::Syscall),
+        ("syscall", BasicBlockInstr::Syscall.into()),
         // stack
-        ("drop_range", Instr::DropRange),
+        ("drop_range", BasicBlockInstr::BadDropRange.into()),
     ])
 });

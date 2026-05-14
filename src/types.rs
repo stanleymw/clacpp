@@ -10,6 +10,7 @@ use thiserror::Error;
 
 use crate::builtins;
 
+use crate::jit::analysis::ResolvedSig;
 use crate::jit::jit_builtins;
 
 pub type Value = i64;
@@ -21,8 +22,8 @@ pub const CRANELIFT_VALUE: cranelift::prelude::Type = I64;
 //     Resolved(FunctionIndex),
 //     Unresolved(String),
 // }
-#[derive(Debug, Clone)]
-pub(crate) struct FuncRef(pub(crate) String);
+// #[derive(Debug, Clone)]
+// pub(crate) struct FuncRef(pub(crate) String);
 
 #[derive(Debug, Clone)]
 pub(crate) enum ArithOp {
@@ -36,24 +37,10 @@ pub(crate) enum ArithOp {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum MemOp {
-    Read8,       // delta = 0, reach = 1
-    ReadNative,  // delta = 0, reach = 1
-    Write8,      // delta = -2, reach = 2
-    WriteNative, // delta = -2, reach = 2
-
-    WidthNative, // delta = 1, reach = 0
-}
-
-// Theorem:
-// total delta >= -(peak reach)
-
-#[derive(Debug, Clone)]
-// Internal clac instruction
-pub(crate) enum Instr {
+pub(crate) enum BasicBlockInstr {
     // data
-    Literal(Value),        // delta = 1, reach = 0
-    FunctionCall(FuncRef), // delta = -argc + return_count, reach = argc
+    Literal(Value),       // delta = 1, reach = 0
+    FunctionCall(String), // delta = -argc + return_count, reach = argc
 
     // side effects
     Quit,    // delta = !, reach = 0
@@ -66,18 +53,161 @@ pub(crate) enum Instr {
     Rot,  // delta = 0, reach = 3
 
     // PRECONDITION: start >= amt
-    DropRange, // <start> <amt> drop_range => delta = -amt-2 , reach = start+2 | else => INDETERMINATE
+    ResolvedDropRange { start: usize, amt: usize }, // <start> <amt> drop_range => delta = -amt , reach = start
+    BadDropRange,
 
     // PRECONDITION: amt >= 1
-    Pick, // <amt> pick => delta = 1, reach = amt | else => INDETERMINATE
+    ResolvedPick(usize), // <amt> pick => delta = 1, reach = amt
+    BadPick,             // delta = 0, reach = indeterminate
 
     // Math/Memory Instructions
     Arith(ArithOp), // delta = -1, reach = 2
     Mem(MemOp),     // see `MemOp`
+}
 
-    // Control Flow
+pub enum ResolveErr<'a> {
+    FunctionUnresolved(&'a str),
+    NotDeterminable,
+    IsQuit,
+}
+
+impl BasicBlockInstr {
+    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<i64, ResolveErr> {
+        use ResolveErr::*;
+
+        match self {
+            BasicBlockInstr::Literal(_) => Ok(1),
+            BasicBlockInstr::FunctionCall(name) => {
+                let sig = funcs.get(name.as_str()).ok_or(FunctionUnresolved(name))?;
+
+                Ok(sig.delta())
+            }
+            BasicBlockInstr::Quit => Err(IsQuit),
+            BasicBlockInstr::Print => Ok(-1),
+            BasicBlockInstr::Syscall => Ok(-6),
+            BasicBlockInstr::Drop => Ok(-1),
+            BasicBlockInstr::Swap => Ok(0),
+            BasicBlockInstr::Rot => Ok(0),
+            BasicBlockInstr::ResolvedDropRange { start: _, amt } => Ok(-(*amt as i64)),
+            BasicBlockInstr::BadDropRange => Err(NotDeterminable),
+            BasicBlockInstr::ResolvedPick(_) => Ok(1),
+            BasicBlockInstr::BadPick => Ok(0),
+            BasicBlockInstr::Arith(_) => Ok(-1),
+            BasicBlockInstr::Mem(mem_op) => Ok(mem_op.delta()),
+        }
+    }
+
+    pub fn reach(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<usize, ResolveErr> {
+        use ResolveErr::*;
+
+        match self {
+            BasicBlockInstr::Literal(_) => Ok(0),
+            BasicBlockInstr::FunctionCall(name) => {
+                let sig = funcs.get(name.as_str()).ok_or(FunctionUnresolved(name))?;
+
+                Ok(sig.reach())
+            }
+            BasicBlockInstr::Quit => Ok(0),
+            BasicBlockInstr::Print => Ok(1),
+            BasicBlockInstr::Syscall => Ok(7),
+            BasicBlockInstr::Drop => Ok(1),
+            BasicBlockInstr::Swap => Ok(2),
+            BasicBlockInstr::Rot => Ok(3),
+            BasicBlockInstr::ResolvedDropRange { start, amt: _ } => Ok(*start),
+            BasicBlockInstr::BadDropRange => Err(NotDeterminable),
+            BasicBlockInstr::ResolvedPick(n) => Ok(*n),
+            BasicBlockInstr::BadPick => Err(NotDeterminable),
+            BasicBlockInstr::Arith(_) => Ok(2),
+            BasicBlockInstr::Mem(mem_op) => Ok(mem_op.reach()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum MemOp {
+    Read8,       // delta = 0, reach = 1
+    ReadNative,  // delta = 0, reach = 1
+    Write8,      // delta = -2, reach = 2
+    WriteNative, // delta = -2, reach = 2
+
+    WidthNative, // delta = 1, reach = 0
+}
+
+impl MemOp {
+    fn delta(&self) -> i64 {
+        match self {
+            MemOp::Read8 => 0,
+            MemOp::ReadNative => 0,
+
+            MemOp::Write8 => -2,
+            MemOp::WriteNative => -2,
+
+            MemOp::WidthNative => 1,
+        }
+    }
+
+    fn reach(&self) -> usize {
+        match self {
+            MemOp::Read8 => 1,
+            MemOp::ReadNative => 1,
+
+            MemOp::Write8 => 2,
+            MemOp::WriteNative => 2,
+
+            MemOp::WidthNative => 0,
+        }
+    }
+}
+
+// Theorem:
+// total delta >= -(peak reach)
+
+#[derive(Debug, Clone)]
+pub(crate) enum ControlFlowInstr {
     If,
     Skip,
+}
+
+#[derive(Debug, Clone)]
+// Internal clac instruction
+pub(crate) enum Instr {
+    BBInstr(BasicBlockInstr),
+    // Control Flow
+    CFInstr(ControlFlowInstr),
+}
+
+impl From<BasicBlockInstr> for Instr {
+    fn from(value: BasicBlockInstr) -> Self {
+        Self::BBInstr(value)
+    }
+}
+
+impl From<ControlFlowInstr> for Instr {
+    fn from(value: ControlFlowInstr) -> Self {
+        Self::CFInstr(value)
+    }
+}
+
+impl TryFrom<Instr> for BasicBlockInstr {
+    type Error = Instr;
+
+    fn try_from(value: Instr) -> Result<Self, Instr> {
+        match value {
+            Instr::BBInstr(basic_block_instr) => Ok(basic_block_instr),
+            x @ Instr::CFInstr(_) => Err(x),
+        }
+    }
+}
+
+impl TryFrom<Instr> for ControlFlowInstr {
+    type Error = Instr;
+
+    fn try_from(value: Instr) -> Result<Self, Instr> {
+        match value {
+            Instr::CFInstr(cfinstr) => Ok(cfinstr),
+            x @ Instr::BBInstr(_) => Err(x),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -109,19 +239,19 @@ impl Token {
     // TODO: maybe it's unnecessary to own the instructions?
     pub(crate) fn to_instruction(self) -> Instr {
         match self {
-            Token::Literal(n) => Instr::Literal(n),
+            Token::Literal(n) => BasicBlockInstr::Literal(n).into(),
             Token::Identifier(name) if let Some(inst) = builtins::FUNCTIONS.get(name.as_str()) => {
                 inst.clone()
             }
-            Token::Identifier(name) => Instr::FunctionCall(FuncRef(name)),
-            Token::Quit => Instr::Quit,
-            Token::Print => Instr::Print,
-            Token::Drop => Instr::Drop,
-            Token::Swap => Instr::Swap,
-            Token::Rot => Instr::Rot,
-            Token::If => Instr::If,
-            Token::Skip => Instr::Skip,
-            Token::Pick => Instr::Pick,
+            Token::Identifier(name) => BasicBlockInstr::FunctionCall(name).into(),
+            Token::Quit => BasicBlockInstr::Quit.into(),
+            Token::Print => BasicBlockInstr::Print.into(),
+            Token::Drop => BasicBlockInstr::Drop.into(),
+            Token::Swap => BasicBlockInstr::Swap.into(),
+            Token::Rot => BasicBlockInstr::Rot.into(),
+            Token::Pick => BasicBlockInstr::BadPick.into(),
+            Token::If => ControlFlowInstr::If.into(),
+            Token::Skip => ControlFlowInstr::Skip.into(),
             _ => unreachable!("Tried to convert function syntax into an instruction"),
         }
     }

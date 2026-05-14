@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    iter::Once,
     rc::Rc,
 };
 
-use ahash::{HashMap, HashMapExt};
+use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 macro_rules! dbg_println {
     ($($args:tt)*) => {
@@ -70,17 +71,14 @@ pub(crate) struct Block {
     pub(crate) terminator: Terminator,
 }
 
-fn to_basic_block_code<'a>(block: &'a [Instr]) -> Result<Vec<BasicBlockInstr>, &'a types::Instr> {
+fn resolve_drops_and_picks<'a>(block: &'a [Instr]) -> Vec<Instr> {
     let mut res = Vec::new();
 
     for (i, instr) in block.iter().enumerate() {
-        let Instr::BBInstr(conv) = instr else {
-            return Err(instr);
-        };
-
-        let out = match conv {
+        use Instr::*;
+        let out = match instr {
             // resolve drop range
-            BasicBlockInstr::BadDropRange
+            BBInstr(BasicBlockInstr::BadDropRange)
                 if i >= 2
                     && let &[
                         Instr::BBInstr(BasicBlockInstr::Literal(start)),
@@ -89,33 +87,33 @@ fn to_basic_block_code<'a>(block: &'a [Instr]) -> Result<Vec<BasicBlockInstr>, &
                     && let Ok(start) = start.try_into()
                     && let Ok(amt) = amt.try_into() =>
             {
-                let BasicBlockInstr::Literal(x) = res.pop().unwrap() else {
+                let BBInstr(BasicBlockInstr::Literal(x)) = res.pop().unwrap() else {
                     unreachable!()
                 };
                 assert_eq!(x as usize, amt);
 
-                let BasicBlockInstr::Literal(x) = res.pop().unwrap() else {
+                let BBInstr(BasicBlockInstr::Literal(x)) = res.pop().unwrap() else {
                     unreachable!()
                 };
                 assert_eq!(x as usize, start);
 
                 assert!(start >= amt);
 
-                BasicBlockInstr::ResolvedDropRange { start, amt }
+                BBInstr(BasicBlockInstr::ResolvedDropRange { start, amt })
             }
             // resolve pick
-            BasicBlockInstr::BadPick
+            BBInstr(BasicBlockInstr::BadPick)
                 if i >= 1
                     && let Instr::BBInstr(BasicBlockInstr::Literal(n)) = block[i - 1]
                     && let Ok(n) = n.try_into() =>
             {
-                let BasicBlockInstr::Literal(x) = res.pop().unwrap() else {
+                let BBInstr(BasicBlockInstr::Literal(x)) = res.pop().unwrap() else {
                     unreachable!()
                 };
                 assert_eq!(x as usize, n);
 
                 assert!(n >= 1);
-                BasicBlockInstr::ResolvedPick(n)
+                BBInstr(BasicBlockInstr::ResolvedPick(n))
             }
             x => x.clone(),
         };
@@ -123,8 +121,64 @@ fn to_basic_block_code<'a>(block: &'a [Instr]) -> Result<Vec<BasicBlockInstr>, &
         res.push(out);
     }
 
-    Ok(res)
+    res
 }
+
+// fn to_basic_block_code<'a>(block: &'a [Instr]) -> Result<Vec<BasicBlockInstr>, &'a types::Instr> {
+//     let mut res = Vec::new();
+
+//     for (i, instr) in block.iter().enumerate() {
+//         let Instr::BBInstr(conv) = instr else {
+//             return Err(instr);
+//         };
+
+//         let out = match conv {
+//             // resolve drop range
+//             BasicBlockInstr::BadDropRange
+//                 if i >= 2
+//                     && let &[
+//                         Instr::BBInstr(BasicBlockInstr::Literal(start)),
+//                         Instr::BBInstr(BasicBlockInstr::Literal(amt)),
+//                     ] = &block[i - 2..i]
+//                     && let Ok(start) = start.try_into()
+//                     && let Ok(amt) = amt.try_into() =>
+//             {
+//                 let BasicBlockInstr::Literal(x) = res.pop().unwrap() else {
+//                     unreachable!()
+//                 };
+//                 assert_eq!(x as usize, amt);
+
+//                 let BasicBlockInstr::Literal(x) = res.pop().unwrap() else {
+//                     unreachable!()
+//                 };
+//                 assert_eq!(x as usize, start);
+
+//                 assert!(start >= amt);
+
+//                 BasicBlockInstr::ResolvedDropRange { start, amt }
+//             }
+//             // resolve pick
+//             BasicBlockInstr::BadPick
+//                 if i >= 1
+//                     && let Instr::BBInstr(BasicBlockInstr::Literal(n)) = block[i - 1]
+//                     && let Ok(n) = n.try_into() =>
+//             {
+//                 let BasicBlockInstr::Literal(x) = res.pop().unwrap() else {
+//                     unreachable!()
+//                 };
+//                 assert_eq!(x as usize, n);
+
+//                 assert!(n >= 1);
+//                 BasicBlockInstr::ResolvedPick(n)
+//             }
+//             x => x.clone(),
+//         };
+
+//         res.push(out);
+//     }
+
+//     Ok(res)
+// }
 
 use z3::ast::Int as Z3Int;
 
@@ -134,7 +188,7 @@ fn max(a: Z3Int, b: Z3Int) -> Z3Int {
 }
 
 fn get_delta_and_reach(
-    block: &[BasicBlockInstr],
+    block: &[Instr],
     known: &HashMap<&str, ResolvedSig>,
     scc: &HashMap<&str, Z3Sig>,
 ) -> Option<Z3Sig> {
@@ -149,8 +203,13 @@ fn get_delta_and_reach(
                 Err(e) => match e {
                     types::ResolveErr::FunctionUnresolved(name) => scc
                         .get(name)
-                        .expect("Unresolved functions should belong to this same SCC")
+                        .or_else(|| {
+                            println!("Could not build due to {} being not determinable", name);
+                            return None;
+                        })?
                         .reach(),
+                    // .expect("Unresolved functions should belong to this same SCC")
+                    // .reach(),
                     types::ResolveErr::NotDeterminable => return None,
                     types::ResolveErr::IsQuit => unreachable!(),
                 },
@@ -162,8 +221,13 @@ fn get_delta_and_reach(
             Err(e) => match e {
                 types::ResolveErr::FunctionUnresolved(name) => scc
                     .get(name)
-                    .expect("unresolved functions should belong to this same SCC")
+                    .or_else(|| {
+                        println!("Could not build due to {} being not determinable", name);
+                        return None;
+                    })?
                     .delta(),
+                // .expect("unresolved functions should belong to this same SCC")
+                // .delta(),
                 types::ResolveErr::NotDeterminable => return None,
                 types::ResolveErr::IsQuit => Z3Int::fresh_const("quit"),
             },
@@ -236,9 +300,9 @@ pub(crate) fn analyze<'names, 'instrs>(
     let sort = petgraph::algo::toposort(graph, None)
         .expect("graph should not have any cycles. Make sure it is condensed");
 
-    let signatures: HashMap<&str, ResolvedSig> = HashMap::new();
+    let mut signatures: HashMap<&str, ResolvedSig> = HashMap::new();
 
-    for scc in sort {
+    'outer: for scc in sort {
         // set up Z3 solver for this scc
         let solver = z3::Solver::new();
         let scc: HashMap<_, _> = graph[scc]
@@ -254,63 +318,127 @@ pub(crate) fn analyze<'names, 'instrs>(
             })
             .collect();
 
-        // let get: Vec<_> = Vec::new();
+        // dbg!(&scc);
 
         for (&func_name, z3sig) in scc.iter() {
-            let graph = create_graph(funcs.get(func_name).unwrap(), &signatures, &scc);
-            dbg!(&graph);
+            let inner = || -> Option<()> {
+                let graph = create_graph(funcs.get(func_name).unwrap(), &signatures, &scc);
+                // dbg!(&graph);
 
-            // FIXME: empty function
-            let start = graph.get(&0).unwrap();
+                // FIXME: empty function
+                let start = graph.get(&0)?;
+                let Some(start_sig) = &start.sig else {
+                    return None;
+                };
 
-            let start_sig = &start.sig;
+                solver.assert(z3sig.argc.eq(start_sig.argc.clone()));
 
-            // FIXME: fix
-            let Some(q) = start_sig else { panic!() };
+                let constraints = build_same_return_count_constraints(start.clone(), z3sig)?;
+                // dbg!(func_name, &constraints);
 
-            solver.assert(z3sig.argc.eq(q.argc.clone()));
+                constraints.into_iter().for_each(|bool| {
+                    solver.assert(bool);
+                });
 
-            build_same_return_count_constraint(start.clone(), &solver, z3sig).unwrap();
+                Some(())
+            };
+
+            let Some(()) = inner() else {
+                println!("RESOLVE FAILED: {func_name}");
+                continue 'outer;
+            };
         }
 
-        let out: Vec<_> = scc
-            .into_iter()
-            .map(|(_, sig)| (sig.argc, sig.retc))
-            .collect();
+        // println!("solving scc = {:?}", scc);
 
-        dbg!(&out);
+        // everything in this SCC is resolvable
+        match solver.check() {
+            z3::SatResult::Sat => {
+                let model = solver.get_model().unwrap();
 
-        for sol in solver.solutions(out.as_slice(), true).take(20) {
-            dbg!(sol);
+                signatures.extend(scc.into_iter().map(|(func_name, Z3Sig { argc, retc })| {
+                    let argc = model
+                        .eval(&argc, true)
+                        .unwrap()
+                        .as_u64()
+                        .expect("Argc should be non-negative")
+                        as usize;
+
+                    let retc = model
+                        .eval(&retc, true)
+                        .unwrap()
+                        .as_u64()
+                        .expect("By Clac++ Theorem") as usize;
+
+                    (func_name, ResolvedSig { argc, retc })
+                }));
+
+                // println!("SAT! signatures = {:?}", signatures);
+            }
+            z3::SatResult::Unsat | z3::SatResult::Unknown => {
+                println!("Could not solve: {:?}", scc);
+                // todo!();
+            }
         }
     }
+
+    println!(
+        "Resolved {}/{} Signatures: {:?}",
+        signatures.len(),
+        funcs.len(),
+        signatures
+    );
+    // dbg!(signatures);
 
     resolved
 }
 
-fn build_same_return_count_constraint(
+fn build_same_return_count_constraints(
     block: Rc<Block>,
-    solver: &z3::Solver,
     func_sig: &Z3Sig,
-) -> Option<()> {
-    match &block.terminator {
-        Terminator::Jump(next) => match next {
-            Next::Trap => {} // no constraints from trap (like rust never type) // TODO: test : func quit ;
-            Next::Terminate => {
-                let sig = &block.sig;
-                let Some(sig) = sig else { return None };
+) -> Option<HashSet<z3::ast::Bool>> {
+    let mut out: HashSet<_> = HashSet::new();
+    let mut to_visit: Vec<Rc<Block>> = vec![block];
 
-                solver.assert(sig.retc.eq(func_sig.retc.clone()));
+    // DFS
+    while let Some(cur) = to_visit.pop() {
+        let mut run = |next: &Next| {
+            match next {
+                Next::Trap => {} // no constraints from trap (like rust never type) // TODO: test : func quit ;
+                Next::Terminate => {
+                    let sig = &cur.sig;
+                    let Some(sig) = sig else {
+                        // dbg!("Bad");
+                        return None;
+                    };
+
+                    out.insert(sig.retc.eq(func_sig.retc.clone()));
+                }
+                Next::Block(next) => {
+                    to_visit.push(next.clone());
+                }
+            };
+
+            Some(())
+        };
+
+        match &cur.terminator {
+            Terminator::Jump(next) => {
+                run(next)?;
             }
-            Next::Block(next) => {
-                build_same_return_count_constraint(next.clone(), solver, func_sig)?;
+            Terminator::If { on_true, on_false } => {
+                run(on_true)?;
+                run(on_false)?;
             }
-        },
-        Terminator::If { on_true, on_false } => todo!(),
-        Terminator::Skip { targets } => todo!(),
+            Terminator::Skip { targets } => {
+                for target in targets {
+                    run(target)?;
+                }
+            }
+        }
     }
 
-    Some(())
+    Some(out)
 }
 
 pub(crate) fn create_graph<'inst>(
@@ -355,7 +483,14 @@ pub(crate) fn create_graph<'inst>(
 
     // NOTE: it is important that this is reversed, we are exploiting the fact that it is impossible for a clac program to jump backward
     for (start, code) in basic_blocks.into_iter().rev() {
-        let (last, begin) = code.split_last().expect("basic_block.len() >= 1");
+        // println!("{code:?}.sig = {:?}", sig);
+
+        // NOTE: it is very important to resolve first before we try finding deltas
+        let resolved = resolve_drops_and_picks(code);
+
+        let sig = get_delta_and_reach(&resolved, known, scc);
+
+        let (last, begin) = resolved.split_last().expect("basic_block.len() >= 1");
 
         let (code, terminator) = match last {
             Instr::CFInstr(cf) => match cf {
@@ -388,10 +523,14 @@ pub(crate) fn create_graph<'inst>(
             Instr::BBInstr(_) => ((code), Terminator::Jump(get_next(&out, start + code.len()))),
         };
 
-        let code = to_basic_block_code(code)
-            .expect("There should be no control flow statements in a basic block");
-
-        let sig = get_delta_and_reach(&code, known, scc);
+        // TODO: improve this (don't clone)
+        let code = code
+            .iter()
+            .map(|x| {
+                BasicBlockInstr::try_from(x.clone())
+                    .expect("There should be no control flow statements in a basic block)")
+            })
+            .collect();
 
         let value = Block {
             code,

@@ -72,7 +72,7 @@ pub enum ResolveErr<'a> {
 }
 
 impl BasicBlockInstr {
-    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<i64, ResolveErr> {
+    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<i64, ResolveErr<'_>> {
         use ResolveErr::*;
 
         match self {
@@ -97,7 +97,7 @@ impl BasicBlockInstr {
         }
     }
 
-    pub fn reach(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<usize, ResolveErr> {
+    pub fn reach(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<usize, ResolveErr<'_>> {
         use ResolveErr::*;
 
         match self {
@@ -168,12 +168,44 @@ pub(crate) enum ControlFlowInstr {
     Skip,
 }
 
+impl ControlFlowInstr {
+    pub fn delta(&self) -> i64 {
+        match self {
+            ControlFlowInstr::If => -1,
+            ControlFlowInstr::Skip => -1,
+        }
+    }
+
+    pub fn reach(&self) -> usize {
+        match self {
+            ControlFlowInstr::If => 1,
+            ControlFlowInstr::Skip => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 // Internal clac instruction
 pub(crate) enum Instr {
     BBInstr(BasicBlockInstr),
     // Control Flow
     CFInstr(ControlFlowInstr),
+}
+
+impl Instr {
+    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<i64, ResolveErr<'_>> {
+        match self {
+            Instr::BBInstr(basic_block_instr) => basic_block_instr.delta(funcs),
+            Instr::CFInstr(control_flow_instr) => Ok(control_flow_instr.delta()),
+        }
+    }
+
+    pub fn reach(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<usize, ResolveErr<'_>> {
+        match self {
+            Instr::BBInstr(basic_block_instr) => basic_block_instr.reach(funcs),
+            Instr::CFInstr(control_flow_instr) => Ok(control_flow_instr.reach()),
+        }
+    }
 }
 
 impl From<BasicBlockInstr> for Instr {

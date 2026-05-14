@@ -26,7 +26,7 @@ pub(crate) enum Terminator {
 pub(crate) enum Next {
     Trap,
     Terminate,
-    Block(Rc<Block>),
+    Block(usize),
 }
 
 #[derive(Debug)]
@@ -294,8 +294,8 @@ fn get_block_breaks_v2(func: &[types::Instr]) -> BTreeSet<usize> {
 pub(crate) fn analyze<'names, 'instrs>(
     graph: &petgraph::Graph<Vec<&'names str>, ()>,
     funcs: &HashMap<&str, &'instrs [types::Instr]>,
-) -> HashMap<&'names str, BTreeMap<usize, Rc<Block>>> {
-    let resolved = HashMap::new();
+) -> HashMap<&'names str, BTreeMap<usize, Block>> {
+    // let resolved = HashMap::new();
 
     let sort = petgraph::algo::toposort(graph, None)
         .expect("graph should not have any cycles. Make sure it is condensed");
@@ -333,7 +333,7 @@ pub(crate) fn analyze<'names, 'instrs>(
 
                 solver.assert(z3sig.argc.eq(start_sig.argc.clone()));
 
-                let constraints = build_same_return_count_constraints(start.clone(), z3sig)?;
+                let constraints = build_same_return_count_constraints(graph, z3sig)?;
                 // dbg!(func_name, &constraints);
 
                 constraints.into_iter().for_each(|bool| {
@@ -390,32 +390,39 @@ pub(crate) fn analyze<'names, 'instrs>(
     );
     // dbg!(signatures);
 
-    resolved
+    todo!()
 }
 
 fn build_same_return_count_constraints(
-    block: Rc<Block>,
+    blocks: BTreeMap<usize, Block>,
     func_sig: &Z3Sig,
 ) -> Option<HashSet<z3::ast::Bool>> {
     let mut out: HashSet<_> = HashSet::new();
-    let mut to_visit: Vec<Rc<Block>> = vec![block];
+    let mut visited: HashSet<usize> = HashSet::new();
+    let mut to_visit: Vec<usize> = vec![0];
 
     // DFS
-    while let Some(cur) = to_visit.pop() {
+    while let Some(cur_idx) = to_visit.pop() {
+        debug_assert!(!visited.contains(&cur_idx));
+        visited.insert(cur_idx);
+
+        let cur = &blocks[&cur_idx];
+        // dbg!(to_visit.len());
+
         let mut run = |next: &Next| {
             match next {
                 Next::Trap => {} // no constraints from trap (like rust never type) // TODO: test : func quit ;
                 Next::Terminate => {
-                    let sig = &cur.sig;
-                    let Some(sig) = sig else {
-                        // dbg!("Bad");
+                    let Some(sig) = &cur.sig else {
                         return None;
                     };
 
                     out.insert(sig.retc.eq(func_sig.retc.clone()));
                 }
                 Next::Block(next) => {
-                    to_visit.push(next.clone());
+                    if !visited.contains(next) {
+                        to_visit.push(*next);
+                    }
                 }
             };
 
@@ -445,7 +452,7 @@ pub(crate) fn create_graph<'inst>(
     func: &'inst [types::Instr],
     known: &HashMap<&str, ResolvedSig>,
     scc: &HashMap<&str, Z3Sig>,
-) -> BTreeMap<usize, Rc<Block>> {
+) -> BTreeMap<usize, Block> {
     let breaks: Vec<usize> = get_block_breaks_v2(func).into_iter().collect();
     debug_assert!(breaks.is_sorted());
 
@@ -469,21 +476,24 @@ pub(crate) fn create_graph<'inst>(
 
     dbg_println!("basic blocks = {:?}", basic_blocks);
 
-    let mut out: BTreeMap<usize, Rc<Block>> = BTreeMap::new();
+    let mut out: BTreeMap<_, _> = BTreeMap::new();
 
-    let get_next = |out: &BTreeMap<usize, Rc<Block>>, idx: usize| {
-        if idx > func.len() {
-            return Next::Trap;
-        } else if idx == func.len() {
-            return Next::Terminate;
-        }
-
-        return Next::Block(out.get(&idx).unwrap().clone());
-    };
-
-    // NOTE: it is important that this is reversed, we are exploiting the fact that it is impossible for a clac program to jump backward
     for (start, code) in basic_blocks.into_iter().rev() {
         // println!("{code:?}.sig = {:?}", sig);
+
+        let get_next = |idx: usize| {
+            if idx > func.len() {
+                return Next::Trap;
+            } else if idx == func.len() {
+                return Next::Terminate;
+            }
+
+            assert!(idx < func.len());
+
+            // NOTE: it is important that order of iteration is reversed, we are exploiting the fact that it is impossible for a clac program to jump backward
+            assert!(out.contains_key(&idx));
+            return Next::Block(idx);
+        };
 
         // NOTE: it is very important to resolve first before we try finding deltas
         let resolved = resolve_drops_and_picks(code);
@@ -497,8 +507,8 @@ pub(crate) fn create_graph<'inst>(
                 ControlFlowInstr::If => (
                     (begin),
                     Terminator::If {
-                        on_true: get_next(&out, start + code.len()),
-                        on_false: get_next(&out, start + code.len() + 3),
+                        on_true: get_next(start + code.len()),
+                        on_false: get_next(start + code.len() + 3),
                     },
                 ),
                 ControlFlowInstr::Skip
@@ -508,19 +518,19 @@ pub(crate) fn create_graph<'inst>(
                 {
                     (
                         (begin2),
-                        Terminator::Jump(get_next(&out, start + code.len() + conv)),
+                        Terminator::Jump(get_next(start + code.len() + conv)),
                     )
                 }
                 ControlFlowInstr::Skip => (
                     (begin),
                     Terminator::Skip {
                         targets: ((start + code.len())..=func.len())
-                            .map(|val| get_next(&out, val))
+                            .map(|val| get_next(val))
                             .collect(),
                     },
                 ),
             },
-            Instr::BBInstr(_) => ((code), Terminator::Jump(get_next(&out, start + code.len()))),
+            Instr::BBInstr(_) => ((code), Terminator::Jump(get_next(start + code.len()))),
         };
 
         // TODO: improve this (don't clone)
@@ -538,7 +548,7 @@ pub(crate) fn create_graph<'inst>(
             terminator,
         };
 
-        out.insert(start, Rc::new(value));
+        out.insert(start, value);
     }
 
     out

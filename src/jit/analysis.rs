@@ -328,7 +328,7 @@ pub(crate) fn analyze<'names, 'instrs>(
 
                 signatures.extend(scc.into_iter().map(|(func_name, sig)| {
                     let var_name = (func_name, solve_sig(sig));
-                    println!("Resolved {var_name:?}");
+                    // println!("Resolved {var_name:?}");
                     var_name
                 }));
 
@@ -357,18 +357,32 @@ fn build_function_constraints_from_block_signatures(
     blocks: &BTreeMap<usize, (Block, Option<Z3Sig>)>,
     // ) -> Option<HashSet<z3::ast::Bool>> {
 ) -> Option<(Z3Sig, HashSet<z3::ast::Bool>)> {
-    // let mut out: HashSet<_> = HashSet::new();
-    // let mut visited: HashSet<usize> = HashSet::new();
-    // let mut to_visit: Vec<usize> = vec![0];
+    if blocks.is_empty() {
+        return Some((
+            Z3Sig {
+                delta: 0.into(),
+                reach: 0.into(),
+            },
+            HashSet::new(),
+        ));
+    }
 
-    fn resolve_path(
+    fn build_path_signatures_starting_from_here<'a>(
         start: usize,
         blocks: &BTreeMap<usize, (Block, Option<Z3Sig>)>,
+        resolved: &'a mut HashMap<usize, Option<Z3Sig>>,
         assertions: &mut HashSet<z3::ast::Bool>,
-    ) -> Option<Z3Sig> {
+    ) -> Option<&'a Z3Sig> {
+        if resolved.contains_key(&start) {
+            return resolved.get(&start).unwrap().as_ref();
+        }
+
+        let old_start = start;
         let (start, start_sig) = &blocks[&start];
         let Some(my_sig) = start_sig else {
-            return None;
+            // cannot resolve this path due to this block being unresolvable
+            // TODO: assert that old_start is not in resolved
+            return resolved.entry(old_start).or_insert(None).as_ref();
         };
 
         let my_delta = &my_sig.delta;
@@ -388,27 +402,19 @@ fn build_function_constraints_from_block_signatures(
                 }), // my delta and reach
 
                 &Next::Block(next) => {
-                    let next_sig = resolve_path(next, blocks, assertions)?;
-
-                    // let lol = Solver::new();
-                    // for assertion in assertions.iter() {
-                    //     lol.assert(assertion);
-                    // }
-                    // assert_eq!(lol.check(), SatResult::Sat);
-
-                    // println!("Going down path starting at {next}:");
-                    // dbg!(lol.get_model().unwrap().eval(&next_sig.delta, false));
-                    // println!("Going down path starting at {next} ==> {next_sig:?}");
+                    let next_sig = build_path_signatures_starting_from_here(
+                        next, blocks, resolved, assertions,
+                    )?;
 
                     Some(Z3Sig {
-                        delta: my_delta + next_sig.delta,
-                        reach: next_sig.reach - my_delta,
+                        delta: my_delta + next_sig.delta.clone(),
+                        reach: next_sig.reach.clone() - my_delta,
                     })
                 }
             }
         };
 
-        match &start.terminator {
+        let to_ins = match &start.terminator {
             Terminator::Jump(next) => {
                 let resolve_next1 = resolve_next(next)?;
 
@@ -449,13 +455,22 @@ fn build_function_constraints_from_block_signatures(
                     reach: max(my_reach.clone(), max_subpath_reach),
                 })
             }
-        }
+        };
+
+        return resolved.entry(old_start).or_insert(to_ins).as_ref();
     }
 
     let mut assertions = HashSet::new();
-    let ret = resolve_path(0, blocks, &mut assertions)?;
+    let mut res = HashMap::with_capacity(blocks.len());
+    let _build = build_path_signatures_starting_from_here(0, blocks, &mut res, &mut assertions)?;
 
-    Some((ret, assertions))
+    let out = res
+        .remove_entry(&0)
+        .expect("Should contain 0")
+        .1
+        .expect("Since build passed");
+
+    Some((out, assertions))
 }
 
 pub(crate) fn create_graph<'inst>(

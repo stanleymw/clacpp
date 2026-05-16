@@ -205,6 +205,53 @@ fn get_block_breaks_v2(func: &[types::Instr]) -> BTreeSet<usize> {
     breaks
 }
 
+fn solve_sig(
+    model: &z3::Model,
+    solver: &z3::Solver,
+    Z3Sig { delta, reach }: &Z3Sig,
+) -> ResolvedSig {
+    let mut delta_n: Option<i64> = model.eval(delta, false).and_then(|x| {
+        // FIXME: this is a little suspicious, maybe add a check that this is actually unbounded?
+        x.as_i64()
+    });
+
+    // TODO: This is kind of a hacky way of checking if something is unbounded. Look into a better way.
+    if let Some(val) = delta_n {
+        solver.push();
+        solver.assert(delta.eq(val + 67));
+
+        let unbounded = solver.check() == z3::SatResult::Sat;
+        if unbounded {
+            assert_eq!(
+                val + 67,
+                solver
+                    .get_model()
+                    .unwrap()
+                    .eval(delta, false)
+                    .unwrap()
+                    .as_i64()
+                    .unwrap()
+            );
+
+            delta_n = None;
+            println!("{delta} is unbounded")
+        }
+
+        solver.pop(1);
+    };
+
+    let reach = model
+        .eval(reach, false)
+        .unwrap()
+        .as_u64()
+        .expect("Reach should be non-negative") as usize;
+
+    ResolvedSig {
+        delta: delta_n,
+        reach,
+    }
+}
+
 pub(crate) fn analyze<'names, 'instrs>(
     graph: &petgraph::Graph<Vec<&'names str>, ()>,
     funcs: &HashMap<&str, &'instrs [types::Instr]>,
@@ -220,8 +267,7 @@ pub(crate) fn analyze<'names, 'instrs>(
 
     // functions with resolved signatures. In any specific SCC, all dependencies (any nodes that come before this scc in the topological sort) should have their signatures in here, given that they are resolvable.
     let mut signatures: HashMap<&str, ResolvedSig> = HashMap::new();
-
-    // let mut out = HashMap::new();
+    let mut out: HashMap<&str, BTreeMap<usize, (Block, Option<ResolvedSig>)>> = HashMap::new();
 
     // TODO: implement layered topological sort for parallelism
     'outer: for scc in sort {
@@ -232,6 +278,7 @@ pub(crate) fn analyze<'names, 'instrs>(
 
         let solver = pipeline.solver();
 
+        // create z3 signatures
         let scc: HashMap<_, _> = graph[scc]
             .iter()
             .map(|&func| {
@@ -245,33 +292,54 @@ pub(crate) fn analyze<'names, 'instrs>(
             })
             .collect();
 
-        let analyzed: Option<Vec<_>> = scc
+        // create graphs
+        let graphs: Vec<_> = scc
             .iter()
-            .map(|(&func_name, func_sig)| -> Option<_> {
+            .map(|(&func_name, z3sig)| {
                 let func_graph = create_graph(funcs.get(func_name).unwrap(), &signatures, &scc);
-
-                // println!("{func_name}.func_graph = {func_graph:?}");
-
-                let (out_sig, constraints) =
-                    build_function_constraints_from_block_signatures(&func_graph)?;
-
-                // print!("Constraints for {func_name} = {constraints:?} | out_sig = {out_sig:?}\n");
-
-                constraints.into_iter().for_each(|bool| {
-                    solver.assert(bool);
-                });
-
-                solver.assert(func_sig.delta.eq(out_sig.delta));
-                solver.assert(func_sig.reach.eq(out_sig.reach));
-
-                Some((func_name, func_graph))
+                (func_name, func_graph, z3sig)
             })
             .collect();
 
+        // analyze graphs
+        let analyzed: Option<Vec<_>> = graphs
+            .iter()
+            .map(|(func_name, func_graph, z3sig)| {
+                let (out_sig, constraints) =
+                    build_function_constraints_from_block_signatures(func_graph)?;
+
+                Some((func_name, out_sig, constraints, z3sig))
+            })
+            .collect();
+
+        // there was a function in thie SCC that could not be analyzed
         let Some(analyzed) = analyzed else {
             println!("ANALYSIS FAILED. Abandoning SCC {:?}", scc);
+
+            out.extend(graphs.into_iter().map(|(func_name, func_graph, _z3sig)| {
+                (
+                    func_name,
+                    func_graph
+                        .into_iter()
+                        // TODO: even in an unresolvable function, maybe there are parts that we can partially resolve? Like parts that only have constants
+                        .map(|(pos, (block, sig))| (pos, (block, None)))
+                        .collect(),
+                )
+            }));
+
             continue 'outer;
         };
+
+        analyzed
+            .into_iter()
+            .for_each(|(func_name, out_sig, assertions, z3sig)| {
+                assertions.iter().for_each(|bool| {
+                    solver.assert(bool);
+                });
+
+                solver.assert(z3sig.delta.eq(out_sig.delta));
+                solver.assert(z3sig.reach.eq(out_sig.reach));
+            });
 
         // println!("solving scc = {:?}", scc);
         let z3::SatResult::Sat = solver.check() else {
@@ -281,53 +349,33 @@ pub(crate) fn analyze<'names, 'instrs>(
 
         let model = solver.get_model().unwrap();
 
-        let solve_sig = |Z3Sig { delta, reach }| {
-            let mut delta_n: Option<i64> = model.eval(&delta, false).and_then(|x| {
-                // FIXME: this is a little suspicious, maybe add a check that this is actually unbounded?
-                x.as_i64()
-            });
-
-            // TODO: This is kind of a hacky way of checking if something is unbounded. Look into a better way.
-            if let Some(val) = delta_n {
-                solver.push();
-                solver.assert(delta.eq(val + 67));
-
-                let unbounded = solver.check() == z3::SatResult::Sat;
-                if unbounded {
-                    assert_eq!(
-                        val + 67,
-                        solver
-                            .get_model()
-                            .unwrap()
-                            .eval(&delta, false)
-                            .unwrap()
-                            .as_i64()
-                            .unwrap()
-                    );
-
-                    delta_n = None;
-                    println!("{delta} is unbounded")
-                }
-
-                solver.pop(1);
-            };
-
-            let reach = model
-                .eval(&reach, false)
-                .unwrap()
-                .as_u64()
-                .expect("Reach should be non-negative") as usize;
-
-            ResolvedSig {
-                delta: delta_n,
-                reach,
-            }
-        };
-
-        signatures.extend(scc.into_iter().map(|(func_name, sig)| {
-            let var_name = (func_name, solve_sig(sig));
+        // add to known signatures
+        signatures.extend(graphs.iter().map(|(func_name, _func_graph, z3sig)| {
+            let var_name = (*func_name, solve_sig(&model, &solver, z3sig));
             // println!("Resolved {var_name:?}");
             var_name
+        }));
+
+        // build out graph (including resolved blocks)
+        out.extend(graphs.into_iter().map(|(func_name, func_graph, _z3sig)| {
+            (
+                func_name,
+                func_graph
+                    .into_iter()
+                    .map(|(pos, (block, sig))| {
+                        let ret = if cfg!(feature = "resolve-basic-blocks") {
+                            match sig {
+                                Some(sig) => Some(solve_sig(&model, &solver, &sig)),
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        (pos, (block, ret))
+                    })
+                    .collect(),
+            )
         }));
     }
 
@@ -338,9 +386,17 @@ pub(crate) fn analyze<'names, 'instrs>(
         signatures
     );
 
-    // dbg!(signatures);
-    std::process::exit(0);
-    todo!()
+    let out = out
+        .into_iter()
+        .map(|(func_name, analyzed_func_graph)| {
+            (
+                func_name,
+                (analyzed_func_graph, signatures.remove(func_name)),
+            )
+        })
+        .collect();
+
+    out
 }
 
 fn build_function_constraints_from_block_signatures(

@@ -673,12 +673,12 @@ impl<T: Module> Compiler<T> {
             .map(|(a, b)| (a.as_str(), b.as_slice()))
             .collect();
 
-        analysis::analyze(&graph, &funcs2);
+        let resolved = analysis::analyze(&graph, &funcs2);
 
-        let x = petgraph::dot::Dot::with_config(&graph, &[]);
-        let out = format!("{:?}", x);
-        let mut file = std::fs::File::create("graph.dot").unwrap();
-        file.write_all(out.as_bytes()).unwrap();
+        // let x = petgraph::dot::Dot::with_config(&graph, &[]);
+        // let out = format!("{:?}", x);
+        // let mut file = std::fs::File::create("graph.dot").unwrap();
+        // file.write_all(out.as_bytes()).unwrap();
 
         todo!();
 

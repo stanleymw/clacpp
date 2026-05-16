@@ -1,0 +1,12 @@
+: func if
+		case1 1 skip
+		case2
+
+
+	   20
+;
+
+
+: case1  6 7 ;
+
+: case2  10 ;

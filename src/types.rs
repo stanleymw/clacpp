@@ -68,7 +68,7 @@ pub(crate) enum BasicBlockInstr {
 pub enum ResolveErr<'a> {
     FunctionUnresolved(&'a str),
     NotDeterminable,
-    IsQuit,
+    Anything,
 }
 
 impl BasicBlockInstr {
@@ -80,9 +80,9 @@ impl BasicBlockInstr {
             BasicBlockInstr::FunctionCall(name) => {
                 let sig = funcs.get(name.as_str()).ok_or(FunctionUnresolved(name))?;
 
-                Ok(sig.delta())
+                sig.delta.ok_or_else(|| Anything)
             }
-            BasicBlockInstr::Quit => Err(IsQuit),
+            BasicBlockInstr::Quit => Err(Anything),
             BasicBlockInstr::Print => Ok(-1),
             BasicBlockInstr::Syscall => Ok(-6),
             BasicBlockInstr::Drop => Ok(-1),
@@ -105,7 +105,7 @@ impl BasicBlockInstr {
             BasicBlockInstr::FunctionCall(name) => {
                 let sig = funcs.get(name.as_str()).ok_or(FunctionUnresolved(name))?;
 
-                Ok(sig.reach())
+                Ok(sig.reach)
             }
             BasicBlockInstr::Quit => Ok(0),
             BasicBlockInstr::Print => Ok(1),

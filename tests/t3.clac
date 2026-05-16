@@ -1,0 +1,30 @@
+
+: func-on_true!-183 67676767 print drop quit ;
+
+: func-on_false!-187 drop ;
+
+: func-handle_error-180
+
+    1 pick -1 -
+    if
+        0 1 skip
+        1
+
+    2 pick 2 pick
+    if
+        func-on_true!-183 1 skip
+        func-on_false!-187
+
+    2 pick 3 2 drop_range
+;
+
+: partial
+
+    2 pick 2 pick
+    if
+        func-on_true!-183 1 skip
+        func-on_false!-187
+
+    2 pick 3 2 drop_range
+;
+

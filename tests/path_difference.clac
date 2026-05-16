@@ -1,0 +1,7 @@
+: a 10 10 ;
+: b 67 ;
+: combine
+	if
+	b 2 skip
+	a drop
+;

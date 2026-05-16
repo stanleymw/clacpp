@@ -100,7 +100,7 @@ fn resolve_drops_and_picks<'a>(block: &'a [Instr]) -> Vec<Instr> {
     res
 }
 
-use z3::ast::Int as Z3Int;
+use z3::{Tactic, ast::Int as Z3Int};
 
 fn max(a: Z3Int, b: Z3Int) -> Z3Int {
     let cond = a.gt(&b);
@@ -124,7 +124,7 @@ fn get_delta_and_reach(
                     types::ResolveErr::FunctionUnresolved(name) => scc
                         .get(name)
                         .or_else(|| {
-                            println!("Could not build due to {} being not determinable. This should only happen because it relies on a function that cannot be resolved", name);
+                            println!("Could not analyze due to {} being not determinable. This should only happen because it relies on a function that cannot be resolved", name);
                             return None;
                         })?
                         .reach
@@ -143,7 +143,7 @@ fn get_delta_and_reach(
                 types::ResolveErr::FunctionUnresolved(name) => scc
                     .get(name)
                     .or_else(|| {
-                        println!("Could not build due to {} being not determinable. This should only happen because it relies on a function that cannot be resolved", name);
+                        println!("Could not analyze due to {} being not determinable. This should only happen because it relies on a function that cannot be resolved", name);
                         return None;
                     })?
                     .delta
@@ -205,14 +205,6 @@ fn get_block_breaks_v2(func: &[types::Instr]) -> BTreeSet<usize> {
     breaks
 }
 
-// TODO wip:
-// pub fn remove_dangling_blocks(function: &mut BTreeMap<usize, Rc<Block>>) {
-//     function.retain(|_, block| {
-//         dbg!(&block, Rc::strong_count(&block));
-//         Rc::strong_count(&block) > 0
-//     });
-// }
-
 pub(crate) fn analyze<'names, 'instrs>(
     graph: &petgraph::Graph<Vec<&'names str>, ()>,
     funcs: &HashMap<&str, &'instrs [types::Instr]>,
@@ -223,17 +215,23 @@ pub(crate) fn analyze<'names, 'instrs>(
         Option<ResolvedSig>,                           // resolved sig of the function
     ),
 > {
-    // let resolved = HashMap::new();
-
     let sort = petgraph::algo::toposort(graph, None)
         .expect("graph should not have any cycles. Make sure it is condensed");
 
-    // functions with resolved signatures
+    // functions with resolved signatures. In any specific SCC, all dependencies (any nodes that come before this scc in the topological sort) should have their signatures in here, given that they are resolvable.
     let mut signatures: HashMap<&str, ResolvedSig> = HashMap::new();
 
+    // let mut out = HashMap::new();
+
+    // TODO: implement layered topological sort for parallelism
     'outer: for scc in sort {
         // set up Z3 solver for this scc
-        let solver = z3::Solver::new();
+        let pipeline = Tactic::new("simplify")
+            .and_then(&Tactic::new("solve-eqs"))
+            .and_then(&Tactic::new("smt"));
+
+        let solver = pipeline.solver();
+
         let scc: HashMap<_, _> = graph[scc]
             .iter()
             .map(|&func| {
@@ -247,11 +245,11 @@ pub(crate) fn analyze<'names, 'instrs>(
             })
             .collect();
 
-        // dbg!(&scc);
-
-        for (&func_name, func_sig) in scc.iter() {
-            let inner = || -> Option<()> {
+        let analyzed: Option<Vec<_>> = scc
+            .iter()
+            .map(|(&func_name, func_sig)| -> Option<_> {
                 let func_graph = create_graph(funcs.get(func_name).unwrap(), &signatures, &scc);
+
                 // println!("{func_name}.func_graph = {func_graph:?}");
 
                 let (out_sig, constraints) =
@@ -266,79 +264,71 @@ pub(crate) fn analyze<'names, 'instrs>(
                 solver.assert(func_sig.delta.eq(out_sig.delta));
                 solver.assert(func_sig.reach.eq(out_sig.reach));
 
-                Some(())
-            };
+                Some((func_name, func_graph))
+            })
+            .collect();
 
-            let Some(()) = inner() else {
-                println!("RESOLVE FAILED: {func_name}. Abandoning SCC {:?}", scc);
-                continue 'outer;
-            };
-        }
+        let Some(analyzed) = analyzed else {
+            println!("ANALYSIS FAILED. Abandoning SCC {:?}", scc);
+            continue 'outer;
+        };
 
         // println!("solving scc = {:?}", scc);
+        let z3::SatResult::Sat = solver.check() else {
+            println!("z3 COULD NOT SOLVE SCC: {:?}", scc);
+            continue 'outer;
+        };
 
-        // everything in this SCC is resolvable
-        match solver.check() {
-            z3::SatResult::Sat => {
-                let model = solver.get_model().unwrap();
+        let model = solver.get_model().unwrap();
 
-                let solve_sig = |Z3Sig { delta, reach }| {
-                    let mut delta_n: Option<i64> = model.eval(&delta, false).and_then(|x| {
-                        // dbg!(&x);
-                        // FIXME: this is a little suspicious, maybe add a check that this is actually unbounded?
-                        x.as_i64()
-                    });
+        let solve_sig = |Z3Sig { delta, reach }| {
+            let mut delta_n: Option<i64> = model.eval(&delta, false).and_then(|x| {
+                // FIXME: this is a little suspicious, maybe add a check that this is actually unbounded?
+                x.as_i64()
+            });
 
-                    if let Some(val) = delta_n {
-                        solver.push();
-                        solver.assert(delta.eq(val + 67));
+            // TODO: This is kind of a hacky way of checking if something is unbounded. Look into a better way.
+            if let Some(val) = delta_n {
+                solver.push();
+                solver.assert(delta.eq(val + 67));
 
-                        let unbounded = solver.check() == z3::SatResult::Sat;
-                        if unbounded {
-                            assert_eq!(
-                                val + 67,
-                                solver
-                                    .get_model()
-                                    .unwrap()
-                                    .eval(&delta, false)
-                                    .unwrap()
-                                    .as_i64()
-                                    .unwrap()
-                            );
+                let unbounded = solver.check() == z3::SatResult::Sat;
+                if unbounded {
+                    assert_eq!(
+                        val + 67,
+                        solver
+                            .get_model()
+                            .unwrap()
+                            .eval(&delta, false)
+                            .unwrap()
+                            .as_i64()
+                            .unwrap()
+                    );
 
-                            delta_n = None;
-                            println!("{delta} is unbounded")
-                        }
+                    delta_n = None;
+                    println!("{delta} is unbounded")
+                }
 
-                        solver.pop(1);
-                    };
+                solver.pop(1);
+            };
 
-                    let reach = model
-                        .eval(&reach, false)
-                        .unwrap()
-                        .as_u64()
-                        .expect("Reach should be non-negative")
-                        as usize;
+            let reach = model
+                .eval(&reach, false)
+                .unwrap()
+                .as_u64()
+                .expect("Reach should be non-negative") as usize;
 
-                    ResolvedSig {
-                        delta: delta_n,
-                        reach,
-                    }
-                };
-
-                signatures.extend(scc.into_iter().map(|(func_name, sig)| {
-                    let var_name = (func_name, solve_sig(sig));
-                    // println!("Resolved {var_name:?}");
-                    var_name
-                }));
-
-                // println!("SAT! signatures = {:?}", signatures);
+            ResolvedSig {
+                delta: delta_n,
+                reach,
             }
-            z3::SatResult::Unsat | z3::SatResult::Unknown => {
-                println!("COULD NOT SOLVE SCC: {:?}", scc);
-                // todo!();
-            }
-        }
+        };
+
+        signatures.extend(scc.into_iter().map(|(func_name, sig)| {
+            let var_name = (func_name, solve_sig(sig));
+            // println!("Resolved {var_name:?}");
+            var_name
+        }));
     }
 
     println!(
@@ -349,7 +339,7 @@ pub(crate) fn analyze<'names, 'instrs>(
     );
 
     // dbg!(signatures);
-
+    std::process::exit(0);
     todo!()
 }
 

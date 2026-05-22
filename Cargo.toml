@@ -29,4 +29,3 @@ z3 = "0.20.0"
 
 [features]
 debug = []
-resolve-basic-blocks = []

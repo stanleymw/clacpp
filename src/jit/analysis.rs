@@ -231,6 +231,14 @@ fn get_block_breaks_v2(func: &[types::Instr]) -> BTreeSet<usize> {
     breaks
 }
 
+fn solve_reach(model: &z3::Model, reach: &Z3Int) -> usize {
+    model
+        .eval(reach, false)
+        .unwrap()
+        .as_u64()
+        .expect("Reach should be non-negative") as usize
+}
+
 fn solve_sig(
     model: &z3::Model,
     solver: &z3::Solver,
@@ -266,11 +274,7 @@ fn solve_sig(
         solver.pop(1);
     };
 
-    let reach = model
-        .eval(reach, false)
-        .unwrap()
-        .as_u64()
-        .expect("Reach should be non-negative") as usize;
+    let reach = solve_reach(model, reach);
 
     ResolvedSig {
         delta: delta_n,
@@ -279,8 +283,9 @@ fn solve_sig(
 }
 
 pub type AnalyzedFunction = (
-    BTreeMap<usize, (Block, Option<ResolvedSig>)>, // function code, with blocks that may have resolved sigs
-    Option<ResolvedSig>,                           // resolved sig of the function
+    BTreeMap<usize, Block>, // function code
+    Option<ResolvedSig>, // resolved sig of the function. If is some variant, then this function is well behaved. As in, no matter the control flow path it takes to the end, it ultimately has the same stack delta.
+                         // TODO: prove theorem where in all well defined functions, all entrypoints to any given block must have the same stack delta
 );
 
 pub type ResolvedInner<'names> = HashMap<&'names str, AnalyzedFunction>;
@@ -305,7 +310,9 @@ pub(crate) fn analyze<'names, 'instrs>(
 
     // functions with resolved signatures. In any specific SCC, all dependencies (any nodes that come before this scc in the topological sort) should have their signatures in here, given that they are resolvable.
     let mut signatures: HashMap<&str, ResolvedSig> = HashMap::new();
-    let mut out: HashMap<&str, BTreeMap<usize, (Block, Option<ResolvedSig>)>> = HashMap::new();
+
+    // functions and code
+    let mut out: HashMap<&str, BTreeMap<usize, Block>> = HashMap::new();
 
     // TODO: implement layered topological sort for parallelism
     'outer: for scc in sort {
@@ -333,52 +340,67 @@ pub(crate) fn analyze<'names, 'instrs>(
             .collect();
 
         // create graphs
-        let graphs: Vec<_> = scc_original
+        let graphs: HashMap<_, _> = scc_original
             .iter()
             .map(|&func_name| {
                 let func_graph =
+                    // TODO: separate the z3 signature part
                     create_graph(funcs.get(func_name).unwrap(), &signatures, &scc_signatures);
+
                 (func_name, func_graph)
             })
             .collect();
 
         // analyze graphs
-        let analyzed: Option<Vec<_>> = graphs
+        let analyzed: Option<HashMap<_, _>> = scc_original
             .iter()
-            .map(|(func_name, func_graph)| {
-                let (out_sig, constraints) =
+            .map(|func_name| {
+                let func_graph = &graphs[func_name];
+                let (mut out_sigs, constraints) =
                     build_function_constraints_from_block_signatures(func_graph)?;
 
-                Some((func_name, out_sig, constraints))
+                let out_sig = out_sigs
+                    .remove(&0)
+                    .unwrap_or_else(|| {
+                        // this should be empty function
+                        assert_eq!(funcs[*func_name].len(), 0);
+
+                        Some(Z3Sig {
+                            delta: 0.into(),
+                            reach: 0.into(),
+                        })
+                    })
+                    .expect("Since Build completed");
+
+                Some((*func_name, (out_sig, constraints)))
             })
             .collect();
+
+        out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
+            (
+                func_name,
+                func_graph
+                    .into_iter()
+                    .map(|(pos, (block, _))| (pos, block))
+                    .collect(),
+            )
+        }));
 
         // there was a function in thie SCC that could not be analyzed
         let Some(analyzed) = analyzed else {
             println!("ANALYSIS FAILED. Abandoning SCC {:?}", scc_signatures);
-
-            out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
-                (
-                    func_name,
-                    func_graph
-                        .into_iter()
-                        // TODO: even in an unresolvable function, maybe there are parts that we can partially resolve? Like parts that only have constants
-                        .map(|(pos, (block, sig))| (pos, (block, None)))
-                        .collect(),
-                )
-            }));
 
             continue 'outer;
         };
 
         analyzed
             .into_iter()
-            .for_each(|(func_name, out_sig, assertions)| {
+            .for_each(|(func_name, (out_sig, assertions))| {
                 assertions.iter().for_each(|bool| {
                     solver.assert(bool);
                 });
 
-                let z3sig = scc_signatures.get(func_name).unwrap();
+                let z3sig = &scc_signatures[func_name];
 
                 solver.assert(z3sig.delta.eq(out_sig.delta));
                 solver.assert(z3sig.reach.eq(out_sig.reach));
@@ -396,29 +418,8 @@ pub(crate) fn analyze<'names, 'instrs>(
         signatures.extend(scc_signatures.iter().map(|(func_name, z3sig)| {
             let var_name = (*func_name, solve_sig(&model, &solver, z3sig));
             // println!("Resolved {var_name:?}");
+
             var_name
-        }));
-
-        // build out graph (including resolved blocks)
-        out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
-            (
-                func_name,
-                func_graph
-                    .into_iter()
-                    .map(|(pos, (block, sig))| {
-                        let ret = if cfg!(feature = "resolve-basic-blocks") {
-                            match sig {
-                                Some(sig) => Some(solve_sig(&model, &solver, &sig)),
-                                None => None,
-                            }
-                        } else {
-                            None
-                        };
-
-                        (pos, (block, ret))
-                    })
-                    .collect(),
-            )
         }));
     }
 
@@ -445,15 +446,9 @@ pub(crate) fn analyze<'names, 'instrs>(
 fn build_function_constraints_from_block_signatures(
     blocks: &BTreeMap<usize, (Block, Option<Z3Sig>)>,
     // ) -> Option<HashSet<z3::ast::Bool>> {
-) -> Option<(Z3Sig, HashSet<z3::ast::Bool>)> {
+) -> Option<(HashMap<usize, Option<Z3Sig>>, HashSet<z3::ast::Bool>)> {
     if blocks.is_empty() {
-        return Some((
-            Z3Sig {
-                delta: 0.into(),
-                reach: 0.into(),
-            },
-            HashSet::new(),
-        ));
+        return Some((HashMap::new(), HashSet::new()));
     }
 
     fn build_path_signatures_starting_from_here<'a>(
@@ -470,7 +465,8 @@ fn build_function_constraints_from_block_signatures(
         let (start, start_sig) = &blocks[&start];
         let Some(my_sig) = start_sig else {
             // cannot resolve this path due to this block being unresolvable
-            // TODO: assert that old_start is not in resolved
+            debug_assert_eq!(resolved.contains_key(&old_start), false);
+
             return resolved.entry(old_start).or_insert(None).as_ref();
         };
 
@@ -537,11 +533,11 @@ fn build_function_constraints_from_block_signatures(
 
                 let max_subpath_reach = resolved
                     .iter()
-                    .fold(0.into(), |a: Z3Int, b| max(a, b.reach.clone()));
+                    .fold(my_reach.clone(), |a: Z3Int, b| max(a, b.reach.clone()));
 
                 Some(Z3Sig {
                     delta: resolved[0].delta.clone(),
-                    reach: max(my_reach.clone(), max_subpath_reach),
+                    reach: max_subpath_reach,
                 })
             }
         };
@@ -551,15 +547,10 @@ fn build_function_constraints_from_block_signatures(
 
     let mut assertions = HashSet::new();
     let mut res = HashMap::with_capacity(blocks.len());
+
     let _build = build_path_signatures_starting_from_here(0, blocks, &mut res, &mut assertions)?;
 
-    let out = res
-        .remove_entry(&0)
-        .expect("Should contain 0")
-        .1
-        .expect("Since build passed");
-
-    Some((out, assertions))
+    Some((res, assertions))
 }
 
 pub(crate) fn create_graph<'inst>(

@@ -693,6 +693,10 @@ impl<T: Module> Compiler<T> {
 
         let resolved = analysis::analyze(&graph, &funcs2);
 
+        dbg!(&resolved);
+
+        todo!();
+
         // let x = petgraph::dot::Dot::with_config(&graph, &[]);
         // let out = format!("{:?}", x);
         // let mut file = std::fs::File::create("graph.dot").unwrap();

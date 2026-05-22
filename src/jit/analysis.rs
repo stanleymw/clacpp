@@ -1,6 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Deref,
+};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use cranelift::prelude::Signature;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 macro_rules! dbg_println {
     ($($args:tt)*) => {
@@ -9,7 +14,7 @@ macro_rules! dbg_println {
     };
 }
 
-use crate::types::{self, BasicBlockInstr, ControlFlowInstr, Instr};
+use crate::types::{self, BasicBlockInstr, CRANELIFT_VALUE, ControlFlowInstr, Instr};
 
 #[derive(Debug)]
 pub(crate) enum Terminator {
@@ -27,9 +32,30 @@ pub(crate) enum Next {
 
 #[derive(Debug)]
 /// A resolved function signature
-pub(crate) struct ResolvedSig {
+pub struct ResolvedSig {
     pub(crate) delta: Option<i64>, // None => never type (any delta)
     pub(crate) reach: usize,
+}
+
+impl ResolvedSig {
+    pub fn to_cranelift_signature(
+        &self,
+        call_conv: cranelift::prelude::isa::CallConv,
+    ) -> Signature {
+        Signature {
+            params: vec![cranelift::prelude::AbiParam::new(CRANELIFT_VALUE); self.reach],
+            returns: {
+                let amt = self.delta.map_or(0, |delta| (self.reach as i64) + delta);
+
+                vec![
+                    cranelift::prelude::AbiParam::new(CRANELIFT_VALUE);
+                    usize::try_from(amt).expect("By Clac++ theorem")
+                ]
+            },
+
+            call_conv,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -40,7 +66,7 @@ pub(crate) struct Z3Sig {
 
 #[derive(Debug)]
 // Each variant is the type of terminator
-pub(crate) struct Block {
+pub struct Block {
     // FIXME: this could be Cow
     pub(crate) code: Vec<BasicBlockInstr>,
     pub(crate) terminator: Terminator,
@@ -252,16 +278,28 @@ fn solve_sig(
     }
 }
 
+pub type AnalyzedFunction = (
+    BTreeMap<usize, (Block, Option<ResolvedSig>)>, // function code, with blocks that may have resolved sigs
+    Option<ResolvedSig>,                           // resolved sig of the function
+);
+
+pub type ResolvedInner<'names> = HashMap<&'names str, AnalyzedFunction>;
+
+#[derive(Debug)]
+pub struct ResolvedFuncMap<'names>(ResolvedInner<'names>);
+
+impl<'x> Deref for ResolvedFuncMap<'x> {
+    type Target = ResolvedInner<'x>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub(crate) fn analyze<'names, 'instrs>(
     graph: &petgraph::Graph<Vec<&'names str>, ()>,
     funcs: &HashMap<&str, &'instrs [types::Instr]>,
-) -> HashMap<
-    &'names str, // function name
-    (
-        BTreeMap<usize, (Block, Option<ResolvedSig>)>, // function code, with blocks that may have resolved sigs
-        Option<ResolvedSig>,                           // resolved sig of the function
-    ),
-> {
+) -> ResolvedFuncMap<'names> {
     let sort = petgraph::algo::toposort(graph, None)
         .expect("graph should not have any cycles. Make sure it is condensed");
 
@@ -278,8 +316,10 @@ pub(crate) fn analyze<'names, 'instrs>(
 
         let solver = pipeline.solver();
 
+        let scc_original = &graph[scc];
+
         // create z3 signatures
-        let scc: HashMap<_, _> = graph[scc]
+        let scc_signatures: HashMap<_, _> = scc_original
             .iter()
             .map(|&func| {
                 (
@@ -293,30 +333,31 @@ pub(crate) fn analyze<'names, 'instrs>(
             .collect();
 
         // create graphs
-        let graphs: Vec<_> = scc
+        let graphs: Vec<_> = scc_original
             .iter()
-            .map(|(&func_name, z3sig)| {
-                let func_graph = create_graph(funcs.get(func_name).unwrap(), &signatures, &scc);
-                (func_name, func_graph, z3sig)
+            .map(|&func_name| {
+                let func_graph =
+                    create_graph(funcs.get(func_name).unwrap(), &signatures, &scc_signatures);
+                (func_name, func_graph)
             })
             .collect();
 
         // analyze graphs
         let analyzed: Option<Vec<_>> = graphs
             .iter()
-            .map(|(func_name, func_graph, z3sig)| {
+            .map(|(func_name, func_graph)| {
                 let (out_sig, constraints) =
                     build_function_constraints_from_block_signatures(func_graph)?;
 
-                Some((func_name, out_sig, constraints, z3sig))
+                Some((func_name, out_sig, constraints))
             })
             .collect();
 
         // there was a function in thie SCC that could not be analyzed
         let Some(analyzed) = analyzed else {
-            println!("ANALYSIS FAILED. Abandoning SCC {:?}", scc);
+            println!("ANALYSIS FAILED. Abandoning SCC {:?}", scc_signatures);
 
-            out.extend(graphs.into_iter().map(|(func_name, func_graph, _z3sig)| {
+            out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
                 (
                     func_name,
                     func_graph
@@ -332,10 +373,12 @@ pub(crate) fn analyze<'names, 'instrs>(
 
         analyzed
             .into_iter()
-            .for_each(|(func_name, out_sig, assertions, z3sig)| {
+            .for_each(|(func_name, out_sig, assertions)| {
                 assertions.iter().for_each(|bool| {
                     solver.assert(bool);
                 });
+
+                let z3sig = scc_signatures.get(func_name).unwrap();
 
                 solver.assert(z3sig.delta.eq(out_sig.delta));
                 solver.assert(z3sig.reach.eq(out_sig.reach));
@@ -343,21 +386,21 @@ pub(crate) fn analyze<'names, 'instrs>(
 
         // println!("solving scc = {:?}", scc);
         let z3::SatResult::Sat = solver.check() else {
-            println!("z3 COULD NOT SOLVE SCC: {:?}", scc);
+            println!("z3 COULD NOT SOLVE SCC: {:?}", scc_signatures);
             continue 'outer;
         };
 
         let model = solver.get_model().unwrap();
 
         // add to known signatures
-        signatures.extend(graphs.iter().map(|(func_name, _func_graph, z3sig)| {
+        signatures.extend(scc_signatures.iter().map(|(func_name, z3sig)| {
             let var_name = (*func_name, solve_sig(&model, &solver, z3sig));
             // println!("Resolved {var_name:?}");
             var_name
         }));
 
         // build out graph (including resolved blocks)
-        out.extend(graphs.into_iter().map(|(func_name, func_graph, _z3sig)| {
+        out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
             (
                 func_name,
                 func_graph
@@ -396,7 +439,7 @@ pub(crate) fn analyze<'names, 'instrs>(
         })
         .collect();
 
-    out
+    ResolvedFuncMap(out)
 }
 
 fn build_function_constraints_from_block_signatures(

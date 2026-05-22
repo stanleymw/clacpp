@@ -1,8 +1,11 @@
-use std::{io::Write, mem::transmute_copy, rc::Rc};
+use std::{collections::BTreeMap, mem::transmute_copy, rc::Rc};
 
 use crate::{
     jit::analysis::{self},
-    types::{self, ArithOp, BasicBlockInstr, CRANELIFT_VALUE, Compiler, Instr, JITFunction, MemOp},
+    types::{
+        self, ArithOp, BasicBlockInstr, CRANELIFT_VALUE, Compiler, FuncMap, Instr, JITFunction,
+        MemOp,
+    },
 };
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use cranelift::{
@@ -20,8 +23,7 @@ use cranelift::{
 };
 
 use cranelift_jit::JITModule;
-use petgraph::{Directed, visit::Walker};
-use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use types::Value as ClacValue;
 
 use cranelift_module::{FuncId, Module, ModuleError, ModuleResult};
@@ -88,7 +90,7 @@ fn compile_block(
     isa: &dyn TargetIsa,
     (funcs, calleemap): (&HashMap<&str, FuncId>, &HashMap<FuncId, FuncRef>),
     (trap_block, term_block): (cranelift::prelude::Block, cranelift::prelude::Block),
-    refs: &ImportRefs,
+    refs: &BuiltinRefs,
 ) {
     // dbg_println!("compiling block = {:?}", block);
 
@@ -110,7 +112,7 @@ fn compile_block(
     let mut tmp: Vec<Value> = Vec::new();
 
     let flush = |tmp: &mut Vec<Value>, bu: &mut FunctionBuilder| {
-        for val in &*tmp {
+        for val in tmp.iter() {
             emit_push(bu, stack, *val);
         }
 
@@ -426,7 +428,8 @@ fn compile_block(
     }
 }
 
-pub(crate) struct ImportRefs {
+#[derive(Debug)]
+pub(crate) struct BuiltinRefs {
     printfunc: FuncRef,
     quitfunc: FuncRef,
     powfunc: FuncRef,
@@ -458,25 +461,24 @@ pub(crate) fn get_function(module: &JITModule, func: FuncId) -> JITFunction {
 }
 
 #[derive(Debug)]
-pub(crate) struct Callees(HashMap<FuncId, FuncRef>);
+pub(crate) struct Callees<'names>(HashMap<&'names str, FuncRef>);
 
-fn get_callees<'a>(
-    line: &[types::Instr],
-    funcs: &HashMap<&'a str, FuncId>,
-) -> HashSet<(&'a str, FuncId)> {
-    let mut ret = HashSet::new();
+#[derive(Debug)]
+pub struct ImportRefs<'names> {
+    clac: Callees<'names>,
+    builtins: BuiltinRefs,
+}
 
-    for instr in line {
-        if let Instr::BBInstr(BasicBlockInstr::FunctionCall(funcref)) = instr
-            && let Some((&name, &id)) = funcs.get_key_value(funcref.as_str())
-        {
-            debug_assert_eq!(name, funcref.as_str());
+fn get_callees(line: &[types::Instr]) -> HashSet<&str> {
+    line.iter()
+        .filter_map(|x| {
+            let Instr::BBInstr(BasicBlockInstr::FunctionCall(funcref)) = x else {
+                return None;
+            };
 
-            ret.insert((name, id));
-        }
-    }
-
-    ret
+            Some(funcref.as_str())
+        })
+        .collect()
 }
 
 impl<T: Module> Compiler<T> {
@@ -488,14 +490,14 @@ impl<T: Module> Compiler<T> {
         &mut self,
         func: &mut cranelift::codegen::ir::Function,
         callees: impl Iterator<Item = FuncId>,
-    ) -> Callees {
+    ) -> HashMap<FuncId, FuncRef> {
         let mut ret = HashMap::new();
 
         for id in callees {
             ret.insert(id, self.module.declare_func_in_func(id, func));
         }
 
-        Callees(ret)
+        ret
     }
 
     pub(crate) fn define_wrapper(
@@ -536,13 +538,11 @@ impl<T: Module> Compiler<T> {
         Ok(wrapper_id)
     }
 
-    pub(crate) fn compile_function(
-        function: &[types::Instr],
+    pub fn compile_function(
+        (function, signature): &analysis::AnalyzedFunction,
         mut ctx: cranelift::codegen::Context,
-        funcs: &HashMap<&str, FuncId>,
-        Callees(callees): Callees,
+        import_refs: ImportRefs,
         isa: &dyn TargetIsa,
-        refs: ImportRefs,
     ) -> Result<cranelift::codegen::Context, CompilerError> {
         if cfg!(feature = "debug") {
             ctx.set_disasm(true);
@@ -551,7 +551,11 @@ impl<T: Module> Compiler<T> {
         let mut fbctx = FunctionBuilderContext::new();
 
         // TODO: fix when better function analysis is added
-        ctx.func.signature = generate_clac_function_signature(isa, CallConv::Tail);
+        ctx.func.signature = signature.as_ref().map_or_else(
+            || generate_clac_function_signature(isa, CallConv::Tail),
+            |x| x.to_cranelift_signature(CallConv::Tail),
+        );
+
         dbg_println!("Callees = {:?}", callees);
 
         let mut bu = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
@@ -600,9 +604,9 @@ impl<T: Module> Compiler<T> {
                 stack,
                 &mut bu,
                 isa,
-                (funcs, &callees),
+                (todo!(), todo!()),
                 (trap_block, term_block),
-                &refs,
+                todo!(),
             );
         }
 
@@ -636,6 +640,7 @@ impl<T: Module> Compiler<T> {
             syscallfunc,
         } = self.imports;
 
+        // assign cranelift FuncIDs
         let declared: HashMap<&str, FuncId> = funcs
             .iter()
             .map(|(name, _)| {
@@ -647,19 +652,32 @@ impl<T: Module> Compiler<T> {
             .collect();
 
         let mut graph: petgraph::Graph<&str, ()> = petgraph::Graph::new();
+
+        // add nodes to graph
         let nodes: HashMap<_, _> = funcs
             .iter()
             .map(|(name, _)| (name.as_str(), graph.add_node(name.as_str())))
             .collect();
 
-        // add edges
-        funcs
+        // get callees from all fucntions
+        // Only consists of Valid callees (callees that exist)
+        let callee_map: HashMap<_, Vec<_>> = funcs
             .iter()
-            .flat_map(|(name, code)| {
-                get_callees(code, &declared)
-                    .into_iter()
-                    .map(|(callee, _)| (name.as_str(), callee))
+            .map(|(name, code)| {
+                (
+                    name.as_str(),
+                    get_callees(code)
+                        .into_iter()
+                        .filter(|callee| funcs.contains_key(*callee))
+                        .collect(),
+                )
             })
+            .collect();
+
+        // add edges
+        callee_map
+            .iter()
+            .flat_map(|(&name, callees)| callees.iter().map(move |callee| (name, callee)))
             .map(|(caller, callee)| (nodes[callee], nodes[caller], ()))
             .for_each(|(a, b, c)| {
                 graph.add_edge(a, b, c);
@@ -680,61 +698,61 @@ impl<T: Module> Compiler<T> {
         // let mut file = std::fs::File::create("graph.dot").unwrap();
         // file.write_all(out.as_bytes()).unwrap();
 
-        todo!();
-
-        // : B ;
-        // : C A ;
-        // : A B C ;
-        //
-        // /-->A --> B
-        // |   |
-        // |   v
-        // \-- C
-
-        let x: HashMap<
-            &str,
-            (
-                &[types::Instr],
-                cranelift::codegen::Context,
-                Callees,
-                ImportRefs,
-            ),
-        > = funcs
-            .into_par_iter()
-            // TODO: since we do this, we can remove get_callees in Self::compile
-            .map(|(name, code)| (name, (code, get_callees(code, &declared))))
-            .collect::<HashMap<_, _>>()
+        let metadata_map: HashMap<&str, _> = callee_map
             .into_iter()
-            .map(|(name, (code, callees))| {
+            .map(|(name, callees)| {
                 let mut ctx = self.module.make_context();
 
-                let callees =
-                    self.declare_callees(&mut ctx.func, callees.into_iter().map(|(_, id)| id));
+                let callees = callees
+                    .into_iter()
+                    .map(|callee| {
+                        (
+                            callee,
+                            self.module.declare_func_in_func(
+                                *declared
+                                    .get(callee)
+                                    .expect("callees should only have valid callees"),
+                                &mut ctx.func,
+                            ),
+                        )
+                    })
+                    .collect();
 
-                let refs = ImportRefs {
+                let builtins = BuiltinRefs {
                     printfunc: self.module.declare_func_in_func(printfunc, &mut ctx.func),
                     quitfunc: self.module.declare_func_in_func(quitfunc, &mut ctx.func),
                     powfunc: self.module.declare_func_in_func(powfunc, &mut ctx.func),
                     syscall: self.module.declare_func_in_func(syscallfunc, &mut ctx.func),
                 };
-                (name.as_str(), (code.as_slice(), ctx, callees, refs))
+
+                (
+                    name,
+                    (
+                        ImportRefs {
+                            clac: Callees(callees),
+                            builtins,
+                        },
+                        ctx,
+                    ),
+                )
             })
             .collect();
 
         let isa = self.module.isa();
 
-        let res: HashMap<_, _> = x
+        let res: HashMap<_, _> = metadata_map
             .into_par_iter()
-            .map(|(name, (code, ctx, callees, refs))| {
-                // println!("Running on thread: {:?}", std::thread::current().id());
+            .map(|(func_name, (import_refs, ctx))| {
+                let analyzed = resolved.get(func_name).unwrap();
+
                 let mut translated =
-                    Self::compile_function(code, ctx, &declared, callees, isa, refs).unwrap();
+                    Self::compile_function(analyzed, ctx, import_refs, isa).unwrap();
 
                 translated
                     .compile(isa, &mut ControlPlane::default())
                     .unwrap();
 
-                (name, translated)
+                (func_name, translated)
             })
             .collect();
 

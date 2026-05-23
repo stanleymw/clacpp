@@ -1,11 +1,7 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::Deref,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use cranelift::prelude::Signature;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 macro_rules! dbg_println {
     ($($args:tt)*) => {
@@ -38,20 +34,22 @@ pub struct ResolvedSig {
 }
 
 impl ResolvedSig {
+    pub fn argc(&self) -> usize {
+        self.reach
+    }
+
+    pub fn retc(&self) -> usize {
+        let amt = self.delta.map_or(0, |delta| (self.reach as i64) + delta);
+        usize::try_from(amt).expect("By Clac++ theorem")
+    }
+
     pub fn to_cranelift_signature(
         &self,
         call_conv: cranelift::prelude::isa::CallConv,
     ) -> Signature {
         Signature {
-            params: vec![cranelift::prelude::AbiParam::new(CRANELIFT_VALUE); self.reach],
-            returns: {
-                let amt = self.delta.map_or(0, |delta| (self.reach as i64) + delta);
-
-                vec![
-                    cranelift::prelude::AbiParam::new(CRANELIFT_VALUE);
-                    usize::try_from(amt).expect("By Clac++ theorem")
-                ]
-            },
+            params: vec![cranelift::prelude::AbiParam::new(CRANELIFT_VALUE); self.argc()],
+            returns: vec![cranelift::prelude::AbiParam::new(CRANELIFT_VALUE); self.retc()],
 
             call_conv,
         }
@@ -282,29 +280,19 @@ fn solve_sig(
     }
 }
 
-pub type AnalyzedFunction = (
-    BTreeMap<usize, Block>, // function code
-    Option<ResolvedSig>, // resolved sig of the function. If is some variant, then this function is well behaved. As in, no matter the control flow path it takes to the end, it ultimately has the same stack delta.
-                         // TODO: prove theorem where in all well defined functions, all entrypoints to any given block must have the same stack delta
-);
+pub struct AnalysisResult<'names> {
+    /// CFG of functions
+    pub code: HashMap<&'names str, BTreeMap<usize, Block>>,
 
-pub type ResolvedInner<'names> = HashMap<&'names str, AnalyzedFunction>;
-
-#[derive(Debug)]
-pub struct ResolvedFuncMap<'names>(ResolvedInner<'names>);
-
-impl<'x> Deref for ResolvedFuncMap<'x> {
-    type Target = ResolvedInner<'x>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+    // resolved sig of the functions. The functions here are well behaved. As in, no matter the control flow path it takes to the end, it ultimately has the same stack delta.
+    // TODO: prove theorem where in all well defined functions, all entrypoints to any given block must have the same stack delta
+    pub resolved_sigs: HashMap<&'names str, ResolvedSig>,
 }
 
 pub(crate) fn analyze<'names, 'instrs>(
     graph: &petgraph::Graph<Vec<&'names str>, ()>,
     funcs: &HashMap<&str, &'instrs [types::Instr]>,
-) -> ResolvedFuncMap<'names> {
+) -> AnalysisResult<'names> {
     let sort = petgraph::algo::toposort(graph, None)
         .expect("graph should not have any cycles. Make sure it is condensed");
 
@@ -430,17 +418,10 @@ pub(crate) fn analyze<'names, 'instrs>(
         signatures
     );
 
-    let out = out
-        .into_iter()
-        .map(|(func_name, analyzed_func_graph)| {
-            (
-                func_name,
-                (analyzed_func_graph, signatures.remove(func_name)),
-            )
-        })
-        .collect();
-
-    ResolvedFuncMap(out)
+    AnalysisResult {
+        code: out,
+        resolved_sigs: signatures,
+    }
 }
 
 fn build_function_constraints_from_block_signatures(

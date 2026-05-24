@@ -364,6 +364,8 @@ pub(crate) fn analyze<'names, 'instrs>(
             })
             .collect();
 
+        // dbg!(&analyzed);
+
         out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
             (
                 func_name,
@@ -560,7 +562,7 @@ pub(crate) fn function_to_basic_blocks<'inst>(
         basic_blocks.push((last, &func[last..]));
     }
 
-    dbg_println!("basic blocks = {:?}", basic_blocks);
+    dbg_println!("pre processed basic blocks = {:?}", basic_blocks);
 
     let mut out: BTreeMap<_, _> = BTreeMap::new();
 

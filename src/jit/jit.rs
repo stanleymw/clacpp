@@ -85,7 +85,7 @@ fn emit_pick(bu: &mut FunctionBuilder, stack: Variable, offset: Value) {
 }
 
 fn compile_block(
-    UnifiedBlock { code, cranelift }: &UnifiedBlock,
+    idx: usize,
     blocks: &BTreeMap<usize, UnifiedBlock>,
     stack: Option<Variable>, // whether this exists will be used to determine whether we flush or not
     bu: &mut FunctionBuilder,
@@ -94,9 +94,22 @@ fn compile_block(
     (trap_block, term_block): (cranelift::prelude::Block, cranelift::prelude::Block),
     block_param_counts: &mut HashMap<usize, usize>,
 ) {
+    let UnifiedBlock { code, cranelift }: &UnifiedBlock = blocks.get(&idx).unwrap();
+
     let cb = *cranelift;
     bu.switch_to_block(cb);
     bu.seal_block(cb);
+
+    if stack.is_none() {
+        let Some(&paramc) = block_param_counts.get(&idx) else {
+            println!("[!] Block {idx}: {code:?} skipped because it is not reachable!");
+            return;
+        };
+
+        for _ in 0..paramc {
+            bu.append_block_param(cb, CRANELIFT_VALUE);
+        }
+    }
 
     // Idea:
     // 2 levels of stack
@@ -117,7 +130,11 @@ fn compile_block(
         }
     };
 
-    dbg_println!("compiling block = {:?} | initial tmp = {:?}", code, tmp);
+    dbg_println!(
+        "compiling block = {:?} | initial tmp = {:?} | block param counts = {block_param_counts:?}",
+        code,
+        tmp
+    );
 
     let flush: Box<dyn Fn(&mut Vec<Value>, &mut FunctionBuilder) -> Vec<Value>> = match stack {
         None => Box::new(|tmp, bu| std::mem::take(tmp)),
@@ -437,42 +454,64 @@ fn compile_block(
         }
     }
 
+    let cache_param_count = |bpc: &mut HashMap<usize, usize>, block: usize, count: usize| {
+        bpc.entry(block)
+            .and_modify(|old| assert_eq!(*old, count))
+            .or_insert(count);
+    };
+
     // build terminator
-    let mut build_return = |bu: &mut FunctionBuilder, next: &analysis::Next| match next {
-        analysis::Next::Trap => {
-            bu.ins().trap(TrapCode::unwrap_user(67));
-        }
-        analysis::Next::Terminate => {
-            let out = &flush(&mut tmp, bu);
+    // let mut build_return = |bu: &mut FunctionBuilder, next: &analysis::Next| ;
 
-            bu.ins().return_(out);
-        }
-        analysis::Next::Block(block) => {
-            let block = blocks[block].cranelift;
-
-            let out: Vec<_> = flush(&mut tmp, bu)
-                .into_iter()
-                .map(|x| BlockArg::Value(x))
-                .collect();
-
-            // TODO: this may add extraneous block arguments
-            bu.ins().jump(block, &out);
-        }
-    };
-
-    let get_block = |next: &analysis::Next, bu: &mut FunctionBuilder| match next {
-        analysis::Next::Trap => {}
-        analysis::Next::Terminate => {}
-        // analysis::Next::Block(block) => block.cranelift_block,
-        analysis::Next::Block(block) => blocks[block].cranelift,
-    };
+    let mut get_block_and_args =
+        |next: &analysis::Next, bu: &mut FunctionBuilder, args: &[BlockArg]| {
+            match next {
+                analysis::Next::Trap => (trap_block, vec![]), // TODO: fix
+                analysis::Next::Terminate => (term_block, Vec::from(args)),
+                analysis::Next::Block(block) => {
+                    cache_param_count(block_param_counts, *block, args.len());
+                    (
+                        blocks[block].cranelift,
+                        if stack.is_none() {
+                            Vec::from(args)
+                        } else {
+                            vec![]
+                        },
+                    )
+                }
+            }
+        };
 
     match &code.terminator {
-        analysis::Terminator::Jump(next) => build_return(bu, next),
-        analysis::Terminator::If { on_true, on_false } => {
-            let on_true = get_block(on_true, bu);
-            let on_false = get_block(on_false, bu);
+        analysis::Terminator::Jump(next) => {
+            match next {
+                analysis::Next::Trap => {
+                    bu.ins().trap(TrapCode::unwrap_user(67));
+                }
+                analysis::Next::Terminate => {
+                    let out = &flush(&mut tmp, bu);
 
+                    bu.ins().return_(out);
+                }
+                analysis::Next::Block(block) => {
+                    let cranelifted = blocks[block].cranelift;
+
+                    let out: Vec<_> = flush(&mut tmp, bu)
+                        .into_iter()
+                        .map(|x| BlockArg::Value(x))
+                        .collect();
+
+                    cache_param_count(block_param_counts, *block, out.len());
+
+                    // TODO: this may add extraneous block arguments
+                    bu.ins().jump(
+                        cranelifted,
+                        if stack.is_none() { out.as_slice() } else { &[] },
+                    );
+                }
+            }
+        }
+        analysis::Terminator::If { on_true, on_false } => {
             let cond = xpop(&mut tmp, bu);
 
             let out: Vec<_> = flush(&mut tmp, bu)
@@ -480,15 +519,14 @@ fn compile_block(
                 .map(|x| BlockArg::Value(x))
                 .collect();
 
-            bu.ins().brif(cond, on_true, &out, on_false, &out);
+            let (on_true, on_true_args) = get_block_and_args(on_true, bu, &out);
+            let (on_false, on_false_args) = get_block_and_args(on_false, bu, &out);
+
+            bu.ins()
+                .brif(cond, on_true, &on_true_args, on_false, &on_false_args);
         }
         analysis::Terminator::Skip { targets } => {
             let mut switch = Switch::new();
-
-            let targets: Vec<_> = targets
-                .into_iter()
-                .map(|nx| (get_block(nx, bu), bu.create_block()))
-                .collect();
 
             let popped = xpop(&mut tmp, bu);
 
@@ -497,20 +535,22 @@ fn compile_block(
                 .map(|x| BlockArg::Value(x))
                 .collect();
 
-            for (i, &(block, trampoline)) in targets.iter().enumerate() {
-                bu.switch_to_block(trampoline);
-                bu.ins().jump(block, &out);
+            let targets: Vec<_> = targets
+                .into_iter()
+                .map(|nx| (get_block_and_args(nx, bu, &out), bu.create_block()))
+                .collect();
 
-                switch.set_entry(i as u128, trampoline);
+            for (i, ((block, args), trampoline)) in targets.iter().enumerate() {
+                bu.switch_to_block(*trampoline);
+                bu.ins().jump(*block, args);
+
+                switch.set_entry(i as u128, *trampoline);
             }
             bu.switch_to_block(cb);
 
-            let trap_block = get_block(&analysis::Next::Trap, bu);
-
             switch.emit(bu, popped, trap_block);
 
-            // seal trap and trampolines
-            bu.seal_block(trap_block);
+            // seal trampolines
             targets
                 .into_iter()
                 .for_each(|(_, trampoline)| bu.seal_block(trampoline));
@@ -620,6 +660,7 @@ impl<T: Module> Compiler<T> {
         let entry = bu.create_block();
         bu.switch_to_block(entry);
         bu.seal_block(entry);
+
         bu.append_block_params_for_function_params(entry);
 
         let stack = bu.block_params(entry)[0];
@@ -746,10 +787,12 @@ impl<T: Module> Compiler<T> {
         }
 
         let mut block_param_counts: HashMap<usize, usize> = HashMap::new();
+        // NOTE: since we do append block params for func params, we don't need to do any additional appends for the entry block
+        block_param_counts.insert(0, 0);
 
-        for (_, block) in function.iter() {
+        for (idx, _) in function.iter() {
             compile_block(
-                block,
+                *idx,
                 &function,
                 stack,
                 &mut bu,

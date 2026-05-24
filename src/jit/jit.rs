@@ -93,6 +93,7 @@ fn compile_block(
     refs: &ImportRefs,
     (trap_block, term_block): (cranelift::prelude::Block, cranelift::prelude::Block),
     block_param_counts: &mut HashMap<usize, usize>,
+    this_is_a_noreturn_function: bool,
 ) {
     let UnifiedBlock { code, cranelift }: &UnifiedBlock = blocks.get(&idx).unwrap();
 
@@ -495,8 +496,11 @@ fn compile_block(
                 }
                 analysis::Next::Terminate => {
                     let out = &flush(&mut tmp, bu);
-
-                    bu.ins().return_(out);
+                    if this_is_a_noreturn_function {
+                        bu.ins().trap(TrapCode::unwrap_user(68));
+                    } else {
+                        bu.ins().return_(out);
+                    }
                 }
                 analysis::Next::Block(block) => {
                     let cranelifted = blocks[block].cranelift;
@@ -792,6 +796,15 @@ impl<T: Module> Compiler<T> {
         // NOTE: since we do append block params for func params, we don't need to do any additional appends for the entry block
         block_param_counts.insert(0, 0);
 
+        // is never type
+        let is_noreturn = match signature {
+            Some(sig) => match sig.delta {
+                None => true,
+                Some(_) => false,
+            },
+            None => false,
+        };
+
         for (idx, _) in function.iter() {
             compile_block(
                 *idx,
@@ -802,6 +815,7 @@ impl<T: Module> Compiler<T> {
                 &import_refs,
                 (trap_block, term_block),
                 &mut block_param_counts,
+                is_noreturn,
             );
         }
 

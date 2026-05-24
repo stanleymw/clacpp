@@ -91,9 +91,9 @@ fn compile_block(
     bu: &mut FunctionBuilder,
     isa: &dyn TargetIsa,
     refs: &ImportRefs,
+    (trap_block, term_block): (cranelift::prelude::Block, cranelift::prelude::Block),
+    block_param_counts: &mut HashMap<usize, usize>,
 ) {
-    dbg_println!("compiling block = {:?}", code);
-
     let cb = *cranelift;
     bu.switch_to_block(cb);
     bu.seal_block(cb);
@@ -116,6 +116,8 @@ fn compile_block(
             Vec::new()
         }
     };
+
+    dbg_println!("compiling block = {:?} | initial tmp = {:?}", code, tmp);
 
     let flush: Box<dyn Fn(&mut Vec<Value>, &mut FunctionBuilder) -> Vec<Value>> = match stack {
         None => Box::new(|tmp, bu| std::mem::take(tmp)),
@@ -441,8 +443,6 @@ fn compile_block(
             bu.ins().trap(TrapCode::unwrap_user(67));
         }
         analysis::Next::Terminate => {
-            println!("ASDASDASD");
-            dbg!(&tmp);
             let out = &flush(&mut tmp, bu);
 
             bu.ins().return_(out);
@@ -456,32 +456,13 @@ fn compile_block(
                 .collect();
 
             // TODO: this may add extraneous block arguments
-            bu.ins().jump(block, out.iter());
+            bu.ins().jump(block, &out);
         }
     };
 
     let get_block = |next: &analysis::Next, bu: &mut FunctionBuilder| match next {
-        analysis::Next::Trap => {
-            let old = bu.current_block().unwrap();
-            let trap_block = bu.create_block();
-            bu.switch_to_block(trap_block);
-
-            bu.ins().trap(TrapCode::unwrap_user(67));
-
-            bu.switch_to_block(old);
-            trap_block
-        }
-        analysis::Next::Terminate => {
-            let old = bu.current_block().unwrap();
-            let term_block = bu.create_block();
-            bu.switch_to_block(term_block);
-
-            let params = Vec::from(bu.block_params(term_block));
-            bu.ins().return_(&params);
-
-            bu.switch_to_block(old);
-            term_block
-        }
+        analysis::Next::Trap => {}
+        analysis::Next::Terminate => {}
         // analysis::Next::Block(block) => block.cranelift_block,
         analysis::Next::Block(block) => blocks[block].cranelift,
     };
@@ -504,18 +485,35 @@ fn compile_block(
         analysis::Terminator::Skip { targets } => {
             let mut switch = Switch::new();
 
-            let targets: Vec<_> = targets.into_iter().map(|nx| get_block(nx, bu)).collect();
-            for (i, block) in targets.into_iter().enumerate() {
-                switch.set_entry(i as u128, block);
-            }
-
-            let trap_block = get_block(&analysis::Next::Trap, bu);
+            let targets: Vec<_> = targets
+                .into_iter()
+                .map(|nx| (get_block(nx, bu), bu.create_block()))
+                .collect();
 
             let popped = xpop(&mut tmp, bu);
 
-            flush(&mut tmp, bu);
+            let out: Vec<_> = flush(&mut tmp, bu)
+                .into_iter()
+                .map(|x| BlockArg::Value(x))
+                .collect();
+
+            for (i, &(block, trampoline)) in targets.iter().enumerate() {
+                bu.switch_to_block(trampoline);
+                bu.ins().jump(block, &out);
+
+                switch.set_entry(i as u128, trampoline);
+            }
+            bu.switch_to_block(cb);
+
+            let trap_block = get_block(&analysis::Next::Trap, bu);
 
             switch.emit(bu, popped, trap_block);
+
+            // seal trap and trampolines
+            bu.seal_block(trap_block);
+            targets
+                .into_iter()
+                .for_each(|(_, trampoline)| bu.seal_block(trampoline));
         }
     }
 }
@@ -721,6 +719,9 @@ impl<T: Module> Compiler<T> {
         bu.append_block_params_for_function_params(entry_block);
         bu.switch_to_block(entry_block);
 
+        // TODO: there should be a better way of ensuring that entry is actually the entry
+        bu.func.layout.append_block(entry_block);
+
         let stack = match signature {
             None => {
                 let entry_block_params = bu.block_params(entry_block);
@@ -735,9 +736,43 @@ impl<T: Module> Compiler<T> {
             Some(_) => None,
         };
 
-        for (_, block) in function.iter() {
-            compile_block(block, &function, stack, &mut bu, isa, &import_refs);
+        let trap_block = bu.create_block();
+        let term_block = bu.create_block();
+
+        let retc = signature.map_or(1, |x| x.retc());
+
+        for _ in 0..retc {
+            bu.append_block_param(term_block, CRANELIFT_VALUE);
         }
+
+        let mut block_param_counts: HashMap<usize, usize> = HashMap::new();
+
+        for (_, block) in function.iter() {
+            compile_block(
+                block,
+                &function,
+                stack,
+                &mut bu,
+                isa,
+                &import_refs,
+                (trap_block, term_block),
+                &mut block_param_counts,
+            );
+        }
+
+        bu.seal_block(trap_block);
+        bu.seal_block(term_block);
+
+        // build trap block
+        bu.switch_to_block(trap_block);
+        bu.ins().trap(TrapCode::unwrap_user(67));
+
+        // build term block
+        bu.switch_to_block(term_block);
+        let params = Vec::from(bu.block_params(term_block));
+        bu.ins().return_(&params);
+
+        println!("ctx func display: {}", bu.func.display());
 
         bu.finalize();
 

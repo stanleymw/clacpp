@@ -1,0 +1,4 @@
+: A   100 print quit ;
+: B   67  print quit ;
+
+: COMBINE  skip  A   B  ;

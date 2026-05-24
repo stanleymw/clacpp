@@ -333,7 +333,7 @@ pub(crate) fn analyze<'names, 'instrs>(
             .map(|&func_name| {
                 let func_graph =
                     // TODO: separate the z3 signature part
-                    create_graph(funcs.get(func_name).unwrap(), &signatures, &scc_signatures);
+                    function_to_basic_blocks(funcs.get(func_name).unwrap(), &signatures, &scc_signatures);
 
                 (func_name, func_graph)
             })
@@ -534,7 +534,7 @@ fn build_function_constraints_from_block_signatures(
     Some((res, assertions))
 }
 
-pub(crate) fn create_graph<'inst>(
+pub(crate) fn function_to_basic_blocks<'inst>(
     func: &'inst [types::Instr],
     known: &HashMap<&str, ResolvedSig>,
     scc: &HashMap<&str, Z3Sig>,

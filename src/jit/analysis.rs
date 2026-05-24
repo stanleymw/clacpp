@@ -239,7 +239,7 @@ fn solve_reach(model: &z3::Model, reach: &Z3Int) -> usize {
 
 fn solve_sig(
     model: &z3::Model,
-    solver: &z3::Solver,
+    solver: &z3::Optimize,
     Z3Sig { delta, reach }: &Z3Sig,
 ) -> ResolvedSig {
     let mut delta_n: Option<i64> = model.eval(delta, false).and_then(|x| {
@@ -252,7 +252,7 @@ fn solve_sig(
         solver.push();
         solver.assert(delta.eq(val + 67));
 
-        let unbounded = solver.check() == z3::SatResult::Sat;
+        let unbounded = solver.check(&[]) == z3::SatResult::Sat;
         if unbounded {
             assert_eq!(
                 val + 67,
@@ -269,7 +269,7 @@ fn solve_sig(
             println!("{delta} is unbounded")
         }
 
-        solver.pop(1);
+        solver.pop();
     };
 
     let reach = solve_reach(model, reach);
@@ -305,11 +305,12 @@ pub(crate) fn analyze<'names, 'instrs>(
     // TODO: implement layered topological sort for parallelism
     'outer: for scc in sort {
         // set up Z3 solver for this scc
-        let pipeline = Tactic::new("simplify")
-            .and_then(&Tactic::new("solve-eqs"))
-            .and_then(&Tactic::new("smt"));
+        // let pipeline = Tactic::new("simplify")
+        //     .and_then(&Tactic::new("solve-eqs"))
+        //     .and_then(&Tactic::new("smt"));
 
-        let solver = pipeline.solver();
+        // let solver = pipeline.optimize();
+        let solver = z3::Optimize::new();
 
         let scc_original = &graph[scc];
 
@@ -394,10 +395,12 @@ pub(crate) fn analyze<'names, 'instrs>(
 
                 solver.assert(z3sig.delta.eq(out_sig.delta));
                 solver.assert(z3sig.reach.eq(out_sig.reach));
+
+                solver.minimize(&z3sig.reach);
             });
 
         // println!("solving scc = {:?}", scc);
-        let z3::SatResult::Sat = solver.check() else {
+        let z3::SatResult::Sat = solver.check(&[]) else {
             println!("z3 COULD NOT SOLVE SCC: {:?}", scc_signatures);
             continue 'outer;
         };

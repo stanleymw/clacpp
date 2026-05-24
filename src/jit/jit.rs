@@ -124,7 +124,10 @@ fn compile_block(
     let mut tmp: Vec<Value> = match stack {
         None => Vec::from(bu.block_params(cb)),
         Some(_) => {
-            assert_eq!(bu.block_params(cb).len(), 1);
+            match idx {
+                0 => assert_eq!(bu.block_params(cb).len(), 1),
+                _ => assert_eq!(bu.block_params(cb).len(), 0),
+            }
 
             Vec::new()
         }
@@ -285,7 +288,9 @@ fn compile_block(
                     Some(callee_sig) => {
                         let argc = callee_sig.argc();
 
-                        (0..argc).map(|_| xpop(&mut tmp, bu)).rev().collect()
+                        let mut out: Vec<_> = (0..argc).map(|_| xpop(&mut tmp, bu)).collect();
+                        out.reverse();
+                        out
                     }
                     None => {
                         let stack = stack.expect(
@@ -540,20 +545,19 @@ fn compile_block(
                 .map(|nx| (get_block_and_args(nx, bu, &out), bu.create_block()))
                 .collect();
 
-            for (i, ((block, args), trampoline)) in targets.iter().enumerate() {
-                bu.switch_to_block(*trampoline);
-                bu.ins().jump(*block, args);
-
+            for (i, (_, trampoline)) in targets.iter().enumerate() {
                 switch.set_entry(i as u128, *trampoline);
             }
-            bu.switch_to_block(cb);
-
             switch.emit(bu, popped, trap_block);
 
             // seal trampolines
             targets
                 .into_iter()
-                .for_each(|(_, trampoline)| bu.seal_block(trampoline));
+                .for_each(|((real_block, args), trampoline)| {
+                    bu.switch_to_block(trampoline);
+                    bu.ins().jump(real_block, &args);
+                    bu.seal_block(trampoline);
+                });
         }
     }
 }
@@ -678,10 +682,8 @@ impl<T: Module> Compiler<T> {
                 let stack_var = bu.declare_var(self.module.isa().pointer_type());
                 bu.def_var(stack_var, stack);
 
-                let args: Vec<_> = (0..argc)
-                    .map(|_| emit_pop(&mut bu, stack_var))
-                    .rev()
-                    .collect();
+                let mut args: Vec<_> = (0..argc).map(|_| emit_pop(&mut bu, stack_var)).collect();
+                args.reverse();
 
                 let ret = bu.ins().call(target, &args);
                 let ret = Vec::from(bu.inst_results(ret));

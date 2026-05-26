@@ -72,7 +72,7 @@ pub enum ResolveErr<'a> {
 }
 
 impl BasicBlockInstr {
-    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<i64, ResolveErr<'_>> {
+    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<isize, ResolveErr<'_>> {
         use ResolveErr::*;
 
         match self {
@@ -88,7 +88,7 @@ impl BasicBlockInstr {
             BasicBlockInstr::Drop => Ok(-1),
             BasicBlockInstr::Swap => Ok(0),
             BasicBlockInstr::Rot => Ok(0),
-            BasicBlockInstr::ResolvedDropRange { start: _, amt } => Ok(-(*amt as i64)),
+            BasicBlockInstr::ResolvedDropRange { start: _, amt } => Ok(-(*amt as isize)),
             BasicBlockInstr::BadDropRange => Err(NotDeterminable),
             BasicBlockInstr::ResolvedPick(_) => Ok(1),
             BasicBlockInstr::BadPick => Ok(0),
@@ -134,7 +134,7 @@ pub(crate) enum MemOp {
 }
 
 impl MemOp {
-    fn delta(&self) -> i64 {
+    fn delta(&self) -> isize {
         match self {
             MemOp::Read8 => 0,
             MemOp::ReadNative => 0,
@@ -169,7 +169,7 @@ pub(crate) enum ControlFlowInstr {
 }
 
 impl ControlFlowInstr {
-    pub fn delta(&self) -> i64 {
+    pub fn delta(&self) -> isize {
         match self {
             ControlFlowInstr::If => -1,
             ControlFlowInstr::Skip => -1,
@@ -193,7 +193,7 @@ pub(crate) enum Instr {
 }
 
 impl Instr {
-    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<i64, ResolveErr<'_>> {
+    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<isize, ResolveErr<'_>> {
         match self {
             Instr::BBInstr(basic_block_instr) => basic_block_instr.delta(funcs),
             Instr::CFInstr(control_flow_instr) => Ok(control_flow_instr.delta()),

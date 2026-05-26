@@ -22,7 +22,7 @@ pub(crate) enum Next {
 #[derive(Debug)]
 /// A resolved function signature
 pub struct ResolvedSig {
-    pub(crate) delta: Option<i64>, // None => never type (any delta)
+    pub(crate) delta: Option<isize>, // None => never type (any delta)
     pub(crate) reach: usize,
 }
 
@@ -32,7 +32,7 @@ impl ResolvedSig {
     }
 
     pub fn retc(&self) -> usize {
-        let amt = self.delta.map_or(0, |delta| (self.reach as i64) + delta);
+        let amt = self.delta.map_or(0, |delta| (self.reach as isize) + delta);
         usize::try_from(amt).expect("By Clac++ theorem")
     }
 

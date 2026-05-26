@@ -1,7 +1,10 @@
 use std::{collections::BTreeMap, mem::transmute_copy, rc::Rc};
 
 use crate::{
-    jit::analysis::{self, ResolvedSig},
+    jit::{
+        analysis::{self, ResolvedSig},
+        inline,
+    },
     types::{
         self, ArithOp, BasicBlockInstr, CRANELIFT_VALUE, Compiler, FuncMap, Instr, JITFunction,
         MemOp,
@@ -834,6 +837,8 @@ impl<T: Module> Compiler<T> {
         println!("ctx func display: {}", bu.func.display());
 
         bu.finalize();
+
+        ctx.inline(inline::ClacInliner {});
 
         Ok(ctx)
     }

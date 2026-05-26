@@ -25,7 +25,6 @@ rayon = "1.12.0"
 rustyline = "18.0.0"
 sc = "0.2.7"
 thiserror = "2.0.18"
-z3 = "0.20.0"
 
 [features]
 debug = []

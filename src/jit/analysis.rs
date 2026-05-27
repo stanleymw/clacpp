@@ -410,13 +410,17 @@ fn find_func_delta(blocks: &BTreeMap<usize, Block>, known: &HashMap<&str, Delta>
             curr_delta,
             match &curr_block.terminator {
                 Terminator::Jump(next) => delta_from_next(next),
-                Terminator::If { on_true, on_false } => {
-                    combine_branching_deltas(delta_from_next(on_true), delta_from_next(on_false))
-                }
-                Terminator::Skip { targets } => targets
-                    .iter()
-                    .map(delta_from_next)
-                    .fold(Delta::Never, combine_branching_deltas),
+                Terminator::If { on_true, on_false } => combine_sequential_deltas(
+                    Delta::Num(-1),
+                    combine_branching_deltas(delta_from_next(on_true), delta_from_next(on_false)),
+                ),
+                Terminator::Skip { targets } => combine_sequential_deltas(
+                    Delta::Num(-1),
+                    targets
+                        .iter()
+                        .map(delta_from_next)
+                        .fold(Delta::Never, combine_branching_deltas),
+                ),
             },
         );
 

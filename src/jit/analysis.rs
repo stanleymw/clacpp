@@ -96,8 +96,46 @@ pub(crate) fn analyze<'names>(
     let mut all_reaches = HashMap::<&str, Reach>::new();
 
     for scc in sccs_in_order {
-        todo!()
+        let scc_func_names = sccs_graph[scc].as_slice();
+
+        // --- Find deltas ---
+
+        // Initially guess that all of the functions are Never
+        let mut delta_guesses: Vec<(&str, Delta)> = scc_func_names
+            .iter()
+            .map(|&name| (name, Delta::Never))
+            .collect();
+        // Repeatedly re-guess
+        loop {
+            delta_guesses.iter().for_each(|(name, d)| {
+                all_deltas.insert(name, d.clone());
+            });
+            let new_delta_guesses: Vec<(&str, Delta)> = scc_func_names
+                .iter()
+                .map(|&name| {
+                    let code = all_blocks
+                        .get(name)
+                        .expect("Function in SCC should have its blocks known");
+                    (name, find_func_delta(code, &all_deltas))
+                })
+                .collect();
+            if new_delta_guesses == delta_guesses {
+                break;
+            }
+            delta_guesses = new_delta_guesses;
+        }
+
+        // --- Do infinite-reach detection ---
+        // todo!();
+
+        // --- Find reaches ---
+        // todo!();
     }
+
+    println!("--- Deltas Found ---");
+    println!("{:#?}", all_deltas);
+
+    todo!();
 
     // Combine Deltas and Reaches into ResolvedSigs
     let all_sigs: HashMap<&str, ResolvedSig> = funcs
@@ -109,7 +147,7 @@ pub(crate) fn analyze<'names>(
                     .expect("Function should have been analyzed for delta"),
                 all_reaches
                     .get(func_name)
-                    .expect("Function should have been analyzed fofr reach"),
+                    .expect("Function should have been analyzed for reach"),
             )
             .map_or(vec![], |sig| vec![(func_name, sig)])
         })
@@ -193,6 +231,7 @@ fn get_block_breaks_v2(func_code: &[Instr]) -> BTreeSet<usize> {
     use {BasicBlockInstr::*, ControlFlowInstr::*, Instr::*};
     let mut breaks = BTreeSet::<usize>::new();
 
+    // Must go forward (takes advantage of Clac control flow)
     for (i, instr) in func_code.iter().enumerate() {
         dbg_println!("{} {:?}", i, instr);
         match instr {
@@ -228,8 +267,8 @@ fn extract_terminator(
     func_length: usize,
 ) -> (&[Instr], Terminator) {
     use {BasicBlockInstr::*, ControlFlowInstr::*, Instr::*, std::cmp::Ordering::*};
-    let get_next = |location: usize| match location.cmp(&func_length) {
-        Less => Next::Block(location),
+    let get_next = |position: usize| match position.cmp(&func_length) {
+        Less => Next::Block(position),
         Equal => Next::Terminate,
         Greater => Next::Trap,
     };
@@ -293,13 +332,35 @@ fn resolve_drops_and_picks(mut block_code: &[Instr]) -> Vec<Instr> {
     result
 }
 
-enum Delta {
+#[derive(PartialEq, Clone, Debug)]
+pub(crate) enum Delta {
     Num(isize),
     Never,
     Inconsistent,
 }
 
-enum Reach {
+fn combine_sequential_deltas(d1: Delta, d2: Delta) -> Delta {
+    use Delta::*;
+    match (d1, d2) {
+        (Never, _) => Never,
+        (_, Never) => Never,
+        (Num(d1), Num(d2)) => Num(d1 + d2),
+        _ => Inconsistent,
+    }
+}
+
+fn combine_branching_deltas(d1: Delta, d2: Delta) -> Delta {
+    use Delta::*;
+    match (d1, d2) {
+        (Never, d2) => d2,
+        (d1, Never) => d1,
+        (Num(d1), Num(d2)) if d1 == d2 => Num(d1),
+        _ => Inconsistent,
+    }
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub(crate) enum Reach {
     Num(usize),
     Infinite,
 }
@@ -317,4 +378,50 @@ fn delta_and_reach_to_resolved_sig(d: &Delta, r: &Reach) -> Option<ResolvedSig> 
         (Delta::Inconsistent, _) => None,
         (_, Reach::Infinite) => None,
     }
+}
+
+fn find_func_delta(blocks: &BTreeMap<usize, Block>, known: &HashMap<&str, Delta>) -> Delta {
+    // A given block's associated path delta is the delta of starting with that block and going to the end of the function
+    let mut path_deltas = BTreeMap::<usize, Delta>::new();
+
+    // for loop must be backward (takes advantage of Clac control flow)
+    for (&curr_pos, curr_block) in blocks.iter().rev() {
+        // Add together body
+        let curr_delta = curr_block
+            .code
+            .iter()
+            .map(|basic_block_instr| basic_block_instr.delta(&known))
+            .fold(Delta::Num(0), combine_sequential_deltas);
+
+        // Lambda to convert Next component of Terminator to Delta
+        let delta_from_next = |next: &Next| -> Delta {
+            match next {
+                Next::Block(next_pos) => path_deltas
+                    .get(next_pos)
+                    .expect("Referenced block's delta should have already been analyzed")
+                    .clone(),
+                Next::Terminate => Delta::Num(0),
+                Next::Trap => Delta::Never,
+            }
+        };
+
+        // Add on terminator
+        let curr_delta = combine_sequential_deltas(
+            curr_delta,
+            match &curr_block.terminator {
+                Terminator::Jump(next) => delta_from_next(next),
+                Terminator::If { on_true, on_false } => {
+                    combine_branching_deltas(delta_from_next(on_true), delta_from_next(on_false))
+                }
+                Terminator::Skip { targets } => targets
+                    .iter()
+                    .map(delta_from_next)
+                    .fold(Delta::Never, combine_branching_deltas),
+            },
+        );
+
+        path_deltas.insert(curr_pos, curr_delta);
+    }
+    // Default delta for empty function is 0
+    path_deltas.get(&0).map_or(Delta::Num(0), Clone::clone)
 }

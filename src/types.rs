@@ -70,10 +70,7 @@ impl BasicBlockInstr {
         use {BasicBlockInstr::*, Delta::*};
         match self {
             Literal(_) => Num(1),
-            FunctionCall(name) => known_deltas
-                .get(name.as_str())
-                .expect("Called function should have known delta")
-                .clone(),
+            FunctionCall(name) => known_deltas.get(name.as_str()).map_or(Never, Clone::clone),
             Quit => Never,
             Print => Num(-1),
             Syscall => Num(-6),
@@ -95,8 +92,7 @@ impl BasicBlockInstr {
             Literal(_) => Num(0),
             FunctionCall(name) => known_reaches
                 .get(name.as_str())
-                .expect("Called function should have known reach")
-                .clone(),
+                .map_or(Num(0), Clone::clone),
             Quit => Num(0),
             Print => Num(1),
             Syscall => Num(7),

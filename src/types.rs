@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::builtins;
 
-use crate::jit::analysis::ResolvedSig;
+use crate::jit::analysis::{Delta, Reach, ResolvedSig};
 use crate::jit::jit_builtins;
 
 pub type Value = i64;
@@ -65,60 +65,46 @@ pub(crate) enum BasicBlockInstr {
     Mem(MemOp),     // see `MemOp`
 }
 
-pub enum ResolveErr<'a> {
-    FunctionUnresolved(&'a str),
-    NotDeterminable,
-    Anything,
-}
-
 impl BasicBlockInstr {
-    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<i64, ResolveErr<'_>> {
-        use ResolveErr::*;
-
+    pub(crate) fn delta(&self, known_deltas: &HashMap<&str, Delta>) -> Delta {
+        use {BasicBlockInstr::*, Delta::*};
         match self {
-            BasicBlockInstr::Literal(_) => Ok(1),
-            BasicBlockInstr::FunctionCall(name) => {
-                let sig = funcs.get(name.as_str()).ok_or(FunctionUnresolved(name))?;
-
-                sig.delta.ok_or_else(|| Anything)
-            }
-            BasicBlockInstr::Quit => Err(Anything),
-            BasicBlockInstr::Print => Ok(-1),
-            BasicBlockInstr::Syscall => Ok(-6),
-            BasicBlockInstr::Drop => Ok(-1),
-            BasicBlockInstr::Swap => Ok(0),
-            BasicBlockInstr::Rot => Ok(0),
-            BasicBlockInstr::ResolvedDropRange { start: _, amt } => Ok(-(*amt as i64)),
-            BasicBlockInstr::BadDropRange => Err(NotDeterminable),
-            BasicBlockInstr::ResolvedPick(_) => Ok(1),
-            BasicBlockInstr::BadPick => Ok(0),
-            BasicBlockInstr::Arith(_) => Ok(-1),
-            BasicBlockInstr::Mem(mem_op) => Ok(mem_op.delta()),
+            Literal(_) => Num(1),
+            FunctionCall(name) => known_deltas.get(name.as_str()).map_or(Never, Clone::clone),
+            Quit => Never,
+            Print => Num(-1),
+            Syscall => Num(-6),
+            Drop => Num(-1),
+            Swap => Num(0),
+            Rot => Num(0),
+            ResolvedDropRange { start: _, amt } => Num(-(*amt as isize)),
+            BadDropRange => NotWellBehaved,
+            ResolvedPick(_) => Num(1),
+            BadPick => Num(0),
+            Arith(_) => Num(-1),
+            Mem(mem_op) => mem_op.delta(),
         }
     }
 
-    pub fn reach(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<usize, ResolveErr<'_>> {
-        use ResolveErr::*;
-
+    pub(crate) fn reach(&self, known_reaches: &HashMap<&str, Reach>) -> Reach {
+        use {BasicBlockInstr::*, Reach::*};
         match self {
-            BasicBlockInstr::Literal(_) => Ok(0),
-            BasicBlockInstr::FunctionCall(name) => {
-                let sig = funcs.get(name.as_str()).ok_or(FunctionUnresolved(name))?;
-
-                Ok(sig.reach)
-            }
-            BasicBlockInstr::Quit => Ok(0),
-            BasicBlockInstr::Print => Ok(1),
-            BasicBlockInstr::Syscall => Ok(7),
-            BasicBlockInstr::Drop => Ok(1),
-            BasicBlockInstr::Swap => Ok(2),
-            BasicBlockInstr::Rot => Ok(3),
-            BasicBlockInstr::ResolvedDropRange { start, amt: _ } => Ok(*start),
-            BasicBlockInstr::BadDropRange => Err(NotDeterminable),
-            BasicBlockInstr::ResolvedPick(n) => Ok(*n),
-            BasicBlockInstr::BadPick => Err(NotDeterminable),
-            BasicBlockInstr::Arith(_) => Ok(2),
-            BasicBlockInstr::Mem(mem_op) => Ok(mem_op.reach()),
+            Literal(_) => Num(0),
+            FunctionCall(name) => known_reaches
+                .get(name.as_str())
+                .map_or(Num(0), Clone::clone),
+            Quit => Num(0),
+            Print => Num(1),
+            Syscall => Num(7),
+            Drop => Num(1),
+            Swap => Num(2),
+            Rot => Num(3),
+            ResolvedDropRange { start, amt: _ } => Num(*start),
+            BadDropRange => Unbounded,
+            ResolvedPick(n) => Num(*n),
+            BadPick => Unbounded,
+            Arith(_) => Num(2),
+            Mem(mem_op) => mem_op.reach(),
         }
     }
 }
@@ -134,27 +120,29 @@ pub(crate) enum MemOp {
 }
 
 impl MemOp {
-    fn delta(&self) -> i64 {
+    pub(crate) fn delta(&self) -> Delta {
+        use {Delta::*, MemOp::*};
         match self {
-            MemOp::Read8 => 0,
-            MemOp::ReadNative => 0,
+            Read8 => Num(0),
+            ReadNative => Num(0),
 
-            MemOp::Write8 => -2,
-            MemOp::WriteNative => -2,
+            Write8 => Num(-2),
+            WriteNative => Num(-2),
 
-            MemOp::WidthNative => 1,
+            WidthNative => Num(1),
         }
     }
 
-    fn reach(&self) -> usize {
+    pub(crate) fn reach(&self) -> Reach {
+        use {MemOp::*, Reach::*};
         match self {
-            MemOp::Read8 => 1,
-            MemOp::ReadNative => 1,
+            Read8 => Num(1),
+            ReadNative => Num(1),
 
-            MemOp::Write8 => 2,
-            MemOp::WriteNative => 2,
+            Write8 => Num(2),
+            WriteNative => Num(2),
 
-            MemOp::WidthNative => 0,
+            WidthNative => Num(0),
         }
     }
 }
@@ -168,44 +156,12 @@ pub(crate) enum ControlFlowInstr {
     Skip,
 }
 
-impl ControlFlowInstr {
-    pub fn delta(&self) -> i64 {
-        match self {
-            ControlFlowInstr::If => -1,
-            ControlFlowInstr::Skip => -1,
-        }
-    }
-
-    pub fn reach(&self) -> usize {
-        match self {
-            ControlFlowInstr::If => 1,
-            ControlFlowInstr::Skip => 1,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 // Internal clac instruction
 pub(crate) enum Instr {
     BBInstr(BasicBlockInstr),
     // Control Flow
     CFInstr(ControlFlowInstr),
-}
-
-impl Instr {
-    pub fn delta(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<i64, ResolveErr<'_>> {
-        match self {
-            Instr::BBInstr(basic_block_instr) => basic_block_instr.delta(funcs),
-            Instr::CFInstr(control_flow_instr) => Ok(control_flow_instr.delta()),
-        }
-    }
-
-    pub fn reach(&self, funcs: &HashMap<&str, ResolvedSig>) -> Result<usize, ResolveErr<'_>> {
-        match self {
-            Instr::BBInstr(basic_block_instr) => basic_block_instr.reach(funcs),
-            Instr::CFInstr(control_flow_instr) => Ok(control_flow_instr.reach()),
-        }
-    }
 }
 
 impl From<BasicBlockInstr> for Instr {

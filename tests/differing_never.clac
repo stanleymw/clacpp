@@ -1,0 +1,6 @@
+: nop ;
+: loop loop ;
+: func if drop nop nop loop ;
+
+
+: bad drop loop drop ;

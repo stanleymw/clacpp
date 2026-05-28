@@ -337,15 +337,16 @@ fn resolve_drops_and_picks(mut block_code: &[Instr]) -> Vec<Instr> {
 pub(crate) enum Delta {
     Num(isize),
     Never,
-    Inconsistent,
+    NotWellBehaved,
 }
 
 fn combine_sequential_deltas(d1: Delta, d2: Delta) -> Delta {
     use Delta::*;
+    // Order of match arms matters here
     match (d1, d2) {
+        (NotWellBehaved, _) | (_, NotWellBehaved) => NotWellBehaved,
         (Never, _) | (_, Never) => Never,
         (Num(d1), Num(d2)) => Num(d1 + d2),
-        _ => Inconsistent,
     }
 }
 
@@ -354,7 +355,7 @@ fn combine_branching_deltas(d1: Delta, d2: Delta) -> Delta {
     match (d1, d2) {
         (Never, d) | (d, Never) => d,
         (Num(d1), Num(d2)) if d1 == d2 => Num(d1),
-        _ => Inconsistent,
+        _ => NotWellBehaved,
     }
 }
 
@@ -419,7 +420,7 @@ fn combine_sequential_reaches((r1, d1): (Reach, Delta), r2: Reach) -> Reach {
         (r1, Delta::Never, _) => r1,
         (Reach::Infinite, _, _) | (_, Delta::Num(_), Reach::Infinite) => Reach::Infinite,
         (Reach::Num(r1), Delta::Num(d1), Reach::Num(r2)) => Reach::Num(max(r1, todo!())),
-        (_, Delta::Inconsistent, _) => todo!(),
+        (_, Delta::NotWellBehaved, _) => todo!(),
     }
 }
 
@@ -493,7 +494,7 @@ fn delta_and_reach_to_resolved_sig(d: &Delta, r: &Reach) -> Option<ResolvedSig> 
             delta: None,
             reach: *r,
         }),
-        (Delta::Inconsistent, _) => None,
+        (Delta::NotWellBehaved, _) => None,
         (_, Reach::Infinite) => None,
     }
 }

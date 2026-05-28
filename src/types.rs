@@ -78,7 +78,7 @@ impl BasicBlockInstr {
             Swap => Num(0),
             Rot => Num(0),
             ResolvedDropRange { start: _, amt } => Num(-(*amt as isize)),
-            BadDropRange => Inconsistent,
+            BadDropRange => NotWellBehaved,
             ResolvedPick(_) => Num(1),
             BadPick => Num(0),
             Arith(_) => Num(-1),

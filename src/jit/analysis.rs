@@ -416,11 +416,26 @@ pub(crate) enum Reach {
 }
 
 fn combine_sequential_reaches((r1, d1): (Reach, Delta), r2: Reach) -> Reach {
+    use std::cmp::Ordering::*;
     match (r1, d1, r2) {
         (r1, Delta::Never, _) => r1,
         (Reach::Infinite, _, _) | (_, Delta::Num(_), Reach::Infinite) => Reach::Infinite,
-        (Reach::Num(r1), Delta::Num(d1), Reach::Num(r2)) => Reach::Num(max(r1, todo!())),
-        (_, Delta::NotWellBehaved, _) => todo!(),
+        (Reach::Num(r1), Delta::Num(d1), Reach::Num(r2)) => Reach::Num(max(
+            r1,
+            r2.checked_sub_signed(d1).unwrap_or_else(|| {
+                if d1 >= 0 {
+                    0
+                } else {
+                    panic!("Overflow during reach calculation")
+                }
+            }),
+        )),
+
+        // If there is an operation with NotWellBehaved Delta, then the whole function should have NotWellBehaved delta,
+        // and we shouldn't be analyzing it for reach anyway
+        (_, Delta::NotWellBehaved, _) => unreachable!(
+            "Reach analysis should not be done on a function with NotWellBehaved delta"
+        ),
     }
 }
 

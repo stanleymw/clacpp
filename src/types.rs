@@ -100,9 +100,9 @@ impl BasicBlockInstr {
             Swap => Num(2),
             Rot => Num(3),
             ResolvedDropRange { start, amt: _ } => Num(*start),
-            BadDropRange => Infinite,
+            BadDropRange => Unbounded,
             ResolvedPick(n) => Num(*n),
-            BadPick => Infinite,
+            BadPick => Unbounded,
             Arith(_) => Num(2),
             Mem(mem_op) => mem_op.reach(),
         }

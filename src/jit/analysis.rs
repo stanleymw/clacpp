@@ -127,10 +127,13 @@ pub(crate) fn analyze<'names>(
             delta_guesses = new_delta_guesses;
         }
 
-        // --- Do infinite-reach detection ---
+        // --- Throw out inconsistent-delta functions (give them dummy/default reach, it shouldn't matter what) ---
         // todo!();
 
-        // --- Find reaches ---
+        // --- Do infinite-reach detection on the remaining reaches ---
+        // todo!();
+
+        // --- Repeatedly guess reaches for those that are neither inconsistent-delta nor infinite-reach ---
         // todo!();
     }
 
@@ -342,10 +345,11 @@ pub(crate) enum Delta {
 
 fn combine_sequential_deltas(d1: Delta, d2: Delta) -> Delta {
     use Delta::*;
-    // Order of match arms matters here
     match (d1, d2) {
-        (NotWellBehaved, _) | (_, NotWellBehaved) => NotWellBehaved,
-        (Never, _) | (_, Never) => Never,
+        (Never, _) => Never, // What comes after doesn't matter due to trap
+        (NotWellBehaved, _) => NotWellBehaved, // Carrying over stack could fail, even if the next operation is Never
+        (Num(_), Never) => Never,
+        (Num(_), NotWellBehaved) => NotWellBehaved,
         (Num(d1), Num(d2)) => Num(d1 + d2),
     }
 }
@@ -409,17 +413,16 @@ fn find_func_delta(blocks: &BTreeMap<usize, Block>, known: &HashMap<&str, Delta>
     path_deltas.get(&0).map_or(Delta::Num(0), Clone::clone)
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Clone, Debug, Default)]
 pub(crate) enum Reach {
     Num(usize),
-    Infinite,
+    #[default]
+    Unbounded,
 }
 
 fn combine_sequential_reaches((r1, d1): (Reach, Delta), r2: Reach) -> Reach {
     use std::cmp::Ordering::*;
     match (r1, d1, r2) {
-        (r1, Delta::Never, _) => r1,
-        (Reach::Infinite, _, _) | (_, Delta::Num(_), Reach::Infinite) => Reach::Infinite,
         (Reach::Num(r1), Delta::Num(d1), Reach::Num(r2)) => Reach::Num(max(
             r1,
             r2.checked_sub_signed(d1).unwrap_or_else(|| {
@@ -430,23 +433,23 @@ fn combine_sequential_reaches((r1, d1): (Reach, Delta), r2: Reach) -> Reach {
                 }
             }),
         )),
-
-        // If there is an operation with NotWellBehaved Delta, then the whole function should have NotWellBehaved delta,
-        // and we shouldn't be analyzing it for reach anyway
-        (_, Delta::NotWellBehaved, _) => unreachable!(
-            "Reach analysis should not be done on a function with NotWellBehaved delta"
-        ),
+        (Reach::Unbounded, Delta::Num(_), _) | (_, Delta::Num(_), Reach::Unbounded) => {
+            Reach::Unbounded
+        }
+        (r1, Delta::Never, _) => r1,
+        (_, Delta::NotWellBehaved, _) => Reach::default(), // Dummy value (should end up being thrown out later anyway)
     }
 }
 
 fn combine_branching_reaches(r1: Reach, r2: Reach) -> Reach {
     use Reach::*;
     match (r1, r2) {
-        (Infinite, _) | (_, Infinite) => Infinite,
+        (Unbounded, _) | (_, Unbounded) => Unbounded,
         (Num(r1), Num(r2)) => Num(max(r1, r2)),
     }
 }
 
+// SHOULD ONLY BE CALLED ON FUNCTIONS WITH WELL-BEHAVED DELTAS
 fn find_func_reach(
     blocks: &BTreeMap<usize, Block>,
     known_deltas: &HashMap<&str, Delta>,
@@ -510,6 +513,6 @@ fn delta_and_reach_to_resolved_sig(d: &Delta, r: &Reach) -> Option<ResolvedSig> 
             reach: *r,
         }),
         (Delta::NotWellBehaved, _) => None,
-        (_, Reach::Infinite) => None,
+        (_, Reach::Unbounded) => None,
     }
 }

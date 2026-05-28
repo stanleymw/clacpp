@@ -7,6 +7,8 @@ use crate::types::{self, BasicBlockInstr, CRANELIFT_VALUE, ControlFlowInstr, Ins
 
 use rayon::prelude::*;
 
+use std::cmp::max;
+
 macro_rules! dbg_println {
     ($($args:tt)*) => {
         #[cfg(feature = "debug")]
@@ -134,8 +136,7 @@ pub(crate) fn analyze<'names>(
 
     println!("--- Deltas Found ---");
     println!("{:#?}", all_deltas);
-
-    todo!();
+    std::process::exit(0);
 
     // Combine Deltas and Reaches into ResolvedSigs
     let all_sigs: HashMap<&str, ResolvedSig> = funcs
@@ -342,8 +343,7 @@ pub(crate) enum Delta {
 fn combine_sequential_deltas(d1: Delta, d2: Delta) -> Delta {
     use Delta::*;
     match (d1, d2) {
-        (Never, _) => Never,
-        (_, Never) => Never,
+        (Never, _) | (_, Never) => Never,
         (Num(d1), Num(d2)) => Num(d1 + d2),
         _ => Inconsistent,
     }
@@ -352,31 +352,9 @@ fn combine_sequential_deltas(d1: Delta, d2: Delta) -> Delta {
 fn combine_branching_deltas(d1: Delta, d2: Delta) -> Delta {
     use Delta::*;
     match (d1, d2) {
-        (Never, d2) => d2,
-        (d1, Never) => d1,
+        (Never, d) | (d, Never) => d,
         (Num(d1), Num(d2)) if d1 == d2 => Num(d1),
         _ => Inconsistent,
-    }
-}
-
-#[derive(PartialEq, Clone, Debug)]
-pub(crate) enum Reach {
-    Num(usize),
-    Infinite,
-}
-
-fn delta_and_reach_to_resolved_sig(d: &Delta, r: &Reach) -> Option<ResolvedSig> {
-    match (d, r) {
-        (Delta::Num(d), Reach::Num(r)) => Some(ResolvedSig {
-            delta: Some(*d),
-            reach: *r,
-        }),
-        (Delta::Never, Reach::Num(r)) => Some(ResolvedSig {
-            delta: None,
-            reach: *r,
-        }),
-        (Delta::Inconsistent, _) => None,
-        (_, Reach::Infinite) => None,
     }
 }
 
@@ -386,8 +364,8 @@ fn find_func_delta(blocks: &BTreeMap<usize, Block>, known: &HashMap<&str, Delta>
 
     // for loop must be backward (takes advantage of Clac control flow)
     for (&curr_pos, curr_block) in blocks.iter().rev() {
-        // Add together body
-        let curr_delta = curr_block
+        // Add together body of current block
+        let block_body_delta = curr_block
             .code
             .iter()
             .map(|basic_block_instr| basic_block_instr.delta(&known))
@@ -406,8 +384,8 @@ fn find_func_delta(blocks: &BTreeMap<usize, Block>, known: &HashMap<&str, Delta>
         };
 
         // Add on terminator
-        let curr_delta = combine_sequential_deltas(
-            curr_delta,
+        let curr_path_delta = combine_sequential_deltas(
+            block_body_delta,
             match &curr_block.terminator {
                 Terminator::Jump(next) => delta_from_next(next),
                 Terminator::If { on_true, on_false } => combine_sequential_deltas(
@@ -419,13 +397,103 @@ fn find_func_delta(blocks: &BTreeMap<usize, Block>, known: &HashMap<&str, Delta>
                     targets
                         .iter()
                         .map(delta_from_next)
-                        .fold(Delta::Never, combine_branching_deltas),
+                        .fold(delta_from_next(&Next::Trap), combine_branching_deltas),
                 ),
             },
         );
 
-        path_deltas.insert(curr_pos, curr_delta);
+        path_deltas.insert(curr_pos, curr_path_delta);
     }
     // Default delta for empty function is 0
     path_deltas.get(&0).map_or(Delta::Num(0), Clone::clone)
+}
+
+#[derive(PartialEq, Clone, Debug)]
+pub(crate) enum Reach {
+    Num(usize),
+    Infinite,
+}
+
+fn combine_sequential_reaches((r1, d1): (Reach, Delta), r2: Reach) -> Reach {
+    match (r1, d1, r2) {
+        (r1, Delta::Never, _) => r1,
+        (Reach::Infinite, _, _) | (_, Delta::Num(_), Reach::Infinite) => Reach::Infinite,
+        (Reach::Num(r1), Delta::Num(d1), Reach::Num(r2)) => Reach::Num(max(r1, todo!())),
+        (_, Delta::Inconsistent, _) => todo!(),
+    }
+}
+
+fn combine_branching_reaches(r1: Reach, r2: Reach) -> Reach {
+    use Reach::*;
+    match (r1, r2) {
+        (Infinite, _) | (_, Infinite) => Infinite,
+        (Num(r1), Num(r2)) => Num(max(r1, r2)),
+    }
+}
+
+fn find_func_reach(
+    blocks: &BTreeMap<usize, Block>,
+    known_deltas: &HashMap<&str, Delta>,
+    known_reaches: &HashMap<&str, Reach>,
+) -> Reach {
+    let mut path_reaches = BTreeMap::<usize, Reach>::new();
+
+    for (&curr_pos, curr_block) in blocks.iter().rev() {
+        let reach_from_next = |next: &Next| -> Reach {
+            match next {
+                Next::Block(next_pos) => path_reaches
+                    .get(next_pos)
+                    .expect("Referenced block's reach should have already been analyzed")
+                    .clone(),
+                Next::Terminate => Reach::Num(0),
+                Next::Trap => Reach::Num(0),
+            }
+        };
+
+        let terminator_reach = match &curr_block.terminator {
+            Terminator::Jump(next) => reach_from_next(next),
+            Terminator::If { on_true, on_false } => combine_sequential_reaches(
+                (Reach::Num(1), Delta::Num(-1)),
+                combine_branching_reaches(reach_from_next(on_true), reach_from_next(on_false)),
+            ),
+            Terminator::Skip { targets } => combine_sequential_reaches(
+                (Reach::Num(1), Delta::Num(-1)),
+                targets
+                    .iter()
+                    .map(reach_from_next)
+                    .fold(reach_from_next(&Next::Trap), combine_branching_reaches),
+            ),
+        };
+
+        let curr_path_reach = curr_block
+            .code
+            .iter()
+            .map(|basic_block_instr| {
+                (
+                    basic_block_instr.reach(&known_reaches),
+                    basic_block_instr.delta(&known_deltas),
+                )
+            })
+            .rev()
+            .fold(terminator_reach, |r, l| combine_sequential_reaches(l, r));
+
+        path_reaches.insert(curr_pos, curr_path_reach);
+    }
+
+    path_reaches.get(&0).map_or(Reach::Num(0), Clone::clone)
+}
+
+fn delta_and_reach_to_resolved_sig(d: &Delta, r: &Reach) -> Option<ResolvedSig> {
+    match (d, r) {
+        (Delta::Num(d), Reach::Num(r)) => Some(ResolvedSig {
+            delta: Some(*d),
+            reach: *r,
+        }),
+        (Delta::Never, Reach::Num(r)) => Some(ResolvedSig {
+            delta: None,
+            reach: *r,
+        }),
+        (Delta::Inconsistent, _) => None,
+        (_, Reach::Infinite) => None,
+    }
 }

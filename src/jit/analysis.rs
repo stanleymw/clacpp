@@ -127,19 +127,57 @@ pub(crate) fn analyze<'names>(
             delta_guesses = new_delta_guesses;
         }
 
-        // --- Throw out inconsistent-delta functions (give them dummy/default reach, it shouldn't matter what) ---
-        // todo!();
+        // --- Throw out functions that are known to be not well-behaved (give them dummy/default reach, it shouldn't matter what) ---
+        let funcs_with_well_behaved_deltas: Vec<&str> = scc_func_names
+            .iter()
+            .map(|&name| name)
+            .filter(|name| {
+                match all_deltas
+                    .get(name)
+                    .expect("Function in SCC should have had its delta analyzed")
+                {
+                    Delta::NotWellBehaved => {
+                        all_reaches.insert(name, Reach::default()); // Dummy value (must be inserted)
+                        false
+                    }
+                    _ => true,
+                }
+            })
+            .collect();
 
         // --- Do infinite-reach detection on the remaining reaches ---
-        // todo!();
+        let funcs_with_well_behaved_deltas_and_bounded_reaches: Vec<&str> = if false {
+            todo!()
+        } else {
+            funcs_with_well_behaved_deltas
+        };
 
-        // --- Repeatedly guess reaches for those that are neither inconsistent-delta nor infinite-reach ---
-        // todo!();
+        // --- Repeatedly guess reaches for those that are neither not-well-behaved-delta nor infinite-reach ---
+        let mut reach_guesses: Vec<(&str, Reach)> =
+            funcs_with_well_behaved_deltas_and_bounded_reaches
+                .iter()
+                .map(|&name| (name, Reach::Num(0)))
+                .collect();
+        loop {
+            reach_guesses.iter().for_each(|(name, r)| {
+                all_reaches.insert(name, r.clone());
+            });
+            let new_reach_guesses: Vec<(&str, Reach)> =
+                funcs_with_well_behaved_deltas_and_bounded_reaches
+                    .iter()
+                    .map(|&name| {
+                        let code = all_blocks
+                            .get(name)
+                            .expect("Function in SCC should have its blocks known");
+                        (name, find_func_reach(code, &all_deltas, &all_reaches))
+                    })
+                    .collect();
+            if new_reach_guesses == reach_guesses {
+                break;
+            }
+            reach_guesses = new_reach_guesses;
+        }
     }
-
-    println!("--- Deltas Found ---");
-    println!("{:#?}", all_deltas);
-    std::process::exit(0);
 
     // Combine Deltas and Reaches into ResolvedSigs
     let all_sigs: HashMap<&str, ResolvedSig> = funcs
@@ -156,6 +194,10 @@ pub(crate) fn analyze<'names>(
             .map_or(vec![], |sig| vec![(func_name, sig)])
         })
         .collect();
+
+    println!("--- Signatures Found ---");
+    println!("{:#?}", all_sigs);
+    std::process::exit(0);
 
     // Return result
     AnalysisResult {
@@ -429,7 +471,7 @@ fn combine_sequential_reaches((r1, d1): (Reach, Delta), r2: Reach) -> Reach {
                 if d1 >= 0 {
                     0
                 } else {
-                    panic!("Overflow during reach calculation")
+                    panic!("Overflow during reach calculation") // TODO Is this panic a problem when we are analyzing post-Never stuff?
                 }
             }),
         )),

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use cranelift::prelude::Signature;
-use petgraph::algo::is_cyclic_directed;
+use petgraph::{algo::is_cyclic_directed, visit::NodeCount};
 
 macro_rules! dbg_println {
     ($($args:tt)*) => {
@@ -295,6 +295,25 @@ fn layered_toposort<'names, 'sccs>(
 ) -> Vec<Vec<petgraph::graph::NodeIndex>> {
     debug_assert_eq!(is_cyclic_directed(graph), false);
 
+    let mut out = Vec::new();
+    let mut unresolved_dependencies: HashMap<_, _> = HashMap::new();
+
+    // initial layer (root nodes / functions with NO callees)
+    let mut layer: Vec<_> = Vec::with_capacity(
+        graph.node_count() / 3, // heuristic based off of observing real world programs
+    );
+
+    for node in graph.node_indices() {
+        let deps = graph
+            .neighbors_directed(node, petgraph::Direction::Incoming)
+            .count();
+
+        unresolved_dependencies.insert(node, deps);
+        if deps == 0 {
+            layer.push(node);
+        }
+    }
+
     let mut unresolved_dependencies: HashMap<_, _> = graph
         .node_indices()
         .map(|node| {
@@ -307,11 +326,6 @@ fn layered_toposort<'names, 'sccs>(
         })
         .collect();
 
-    let mut out = Vec::new();
-
-    // initial layer (root nodes / functions with NO callees)
-    let mut layer: Vec<_> = graph.externals(petgraph::Direction::Incoming).collect();
-
     let mut added_sccs = 0;
 
     while !layer.is_empty() {
@@ -323,6 +337,7 @@ fn layered_toposort<'names, 'sccs>(
 
             for successor in graph.neighbors(*node) {
                 let deps = unresolved_dependencies.get_mut(&successor).unwrap();
+                // should not underflow
                 *deps -= 1;
 
                 if *deps == 0 {

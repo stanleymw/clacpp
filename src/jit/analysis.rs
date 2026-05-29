@@ -151,12 +151,13 @@ pub(crate) fn analyze<'names>(
             .iter()
             .map(|&name| (name, graph.add_node(name)))
             .collect();
-        for caller_name in funcs_with_well_behaved_deltas {
+        for caller_name in funcs_with_well_behaved_deltas.iter() {
             for (callee_name, call_delta) in find_func_calls_with_deltas(
                 all_blocks
                     .get(caller_name)
                     .expect("Name should refer to function in funcs"),
                 &all_deltas,
+                &funcs_with_well_behaved_deltas,
             ) {
                 graph.add_edge(
                     *nodes.get(caller_name).expect(
@@ -575,9 +576,16 @@ fn find_func_reach(
     path_reaches.get(&0).map_or(Reach::Num(0), Clone::clone)
 }
 
-fn basic_block_instr_to_calls_with_deltas<'a>(instr: &'a BasicBlockInstr) -> Vec<(&'a str, isize)> {
+fn basic_block_instr_to_calls_with_deltas<'a>(
+    instr: &'a BasicBlockInstr,
+    funcs_analyzed: &[&str],
+) -> Vec<(&'a str, isize)> {
     match instr {
-        BasicBlockInstr::FunctionCall(func_name_string) => vec![(func_name_string.as_str(), 0)],
+        BasicBlockInstr::FunctionCall(func_name_string)
+            if funcs_analyzed.contains(&func_name_string.as_str()) =>
+        {
+            vec![(func_name_string.as_str(), 0)]
+        }
         _ => vec![],
     }
 }
@@ -616,6 +624,7 @@ fn combine_branching_calls_with_deltas<'a>(
 fn find_func_calls_with_deltas<'a>(
     blocks: &'a BTreeMap<usize, Block>,
     known_deltas: &HashMap<&str, Delta>,
+    funcs_analyzed: &[&str],
 ) -> Vec<(&'a str, isize)> {
     let mut path_calls_with_deltas = BTreeMap::<usize, Vec<(&'a str, isize)>>::new();
 
@@ -652,7 +661,7 @@ fn find_func_calls_with_deltas<'a>(
             .iter()
             .map(|basic_block_instr| {
                 (
-                    basic_block_instr_to_calls_with_deltas(basic_block_instr),
+                    basic_block_instr_to_calls_with_deltas(basic_block_instr, funcs_analyzed),
                     basic_block_instr.delta(&known_deltas),
                 )
             })

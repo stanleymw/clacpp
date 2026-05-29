@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, mem::transmute_copy, rc::Rc};
+use std::{collections::BTreeMap, io::Write, mem::transmute_copy, rc::Rc};
 
 use crate::{
     jit::{

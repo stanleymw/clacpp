@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use cranelift::prelude::Signature;
+use petgraph::algo::is_cyclic_directed;
 
 macro_rules! dbg_println {
     ($($args:tt)*) => {
@@ -289,12 +290,64 @@ pub struct AnalysisResult<'names> {
     pub resolved_sigs: HashMap<&'names str, ResolvedSig>,
 }
 
+fn layered_toposort<'names, 'sccs>(
+    graph: &'sccs petgraph::Graph<Vec<&'names str>, ()>,
+) -> Vec<Vec<petgraph::graph::NodeIndex>> {
+    debug_assert_eq!(is_cyclic_directed(graph), false);
+
+    let mut unresolved_dependencies: HashMap<_, _> = graph
+        .node_indices()
+        .map(|node| {
+            (
+                node,
+                graph
+                    .neighbors_directed(node, petgraph::Direction::Incoming)
+                    .count(),
+            )
+        })
+        .collect();
+
+    let mut out = Vec::new();
+
+    // initial layer (root nodes / functions with NO callees)
+    let mut layer: Vec<_> = graph.externals(petgraph::Direction::Incoming).collect();
+
+    let mut added_sccs = 0;
+
+    while !layer.is_empty() {
+        let mut next_layer = HashSet::new();
+
+        // for everything that depends on the nodes in this layer, we can remove one from their dependencies
+        for node in &layer {
+            debug_assert_eq!(unresolved_dependencies[node], 0);
+
+            for successor in graph.neighbors(*node) {
+                let deps = unresolved_dependencies.get_mut(&successor).unwrap();
+                *deps -= 1;
+
+                if *deps == 0 {
+                    next_layer.insert(successor);
+                }
+            }
+        }
+
+        // update layer
+        let to_push: Vec<_> = std::mem::replace(&mut layer, next_layer.into_iter().collect());
+
+        added_sccs += to_push.len();
+        out.push(to_push);
+    }
+
+    debug_assert_eq!(added_sccs, graph.node_count());
+
+    out
+}
+
 pub(crate) fn analyze<'names, 'instrs>(
     graph: &petgraph::Graph<Vec<&'names str>, ()>,
     funcs: &HashMap<&str, &'instrs [types::Instr]>,
 ) -> AnalysisResult<'names> {
-    let sort = petgraph::algo::toposort(graph, None)
-        .expect("graph should not have any cycles. Make sure it is condensed");
+    let sort = layered_toposort(graph);
 
     // functions with resolved signatures. In any specific SCC, all dependencies (any nodes that come before this scc in the topological sort) should have their signatures in here, given that they are resolvable.
     let mut signatures: HashMap<&str, ResolvedSig> = HashMap::new();
@@ -302,34 +355,36 @@ pub(crate) fn analyze<'names, 'instrs>(
     // functions and code
     let mut out: HashMap<&str, BTreeMap<usize, Block>> = HashMap::new();
 
-    // TODO: implement layered topological sort for parallelism
-    'outer: for scc in sort {
-        // set up Z3 solver for this scc
-        // let pipeline = Tactic::new("simplify")
-        //     .and_then(&Tactic::new("solve-eqs"))
-        //     .and_then(&Tactic::new("smt"));
+    // TODO: implement parallelism
+    for layer in sort {
+        // every scc in this layer should be done in parallel
+        'outer: for scc in layer {
+            // set up Z3 solver for this scc
+            // let pipeline = Tactic::new("simplify")
+            //     .and_then(&Tactic::new("solve-eqs"))
+            //     .and_then(&Tactic::new("smt"));
 
-        // let solver = pipeline.optimize();
-        let solver = z3::Optimize::new();
+            // let solver = pipeline.optimize();
+            let solver = z3::Optimize::new();
 
-        let scc_original = &graph[scc];
+            let scc_original = &graph[scc];
 
-        // create z3 signatures
-        let scc_signatures: HashMap<_, _> = scc_original
-            .iter()
-            .map(|&func| {
-                (
-                    func,
-                    Z3Sig {
-                        delta: Z3Int::new_const(format!("{func}_delta")),
-                        reach: Z3Int::new_const(format!("{func}_reach")),
-                    },
-                )
-            })
-            .collect();
+            // create z3 signatures
+            let scc_signatures: HashMap<_, _> = scc_original
+                .iter()
+                .map(|&func| {
+                    (
+                        func,
+                        Z3Sig {
+                            delta: Z3Int::new_const(format!("{func}_delta")),
+                            reach: Z3Int::new_const(format!("{func}_reach")),
+                        },
+                    )
+                })
+                .collect();
 
-        // create graphs
-        let graphs: HashMap<_, _> = scc_original
+            // create graphs
+            let graphs: HashMap<_, _> = scc_original
             .iter()
             .map(|&func_name| {
                 let func_graph =
@@ -340,80 +395,81 @@ pub(crate) fn analyze<'names, 'instrs>(
             })
             .collect();
 
-        // analyze graphs
-        let analyzed: Option<HashMap<_, _>> = scc_original
-            .iter()
-            .map(|func_name| {
-                let func_graph = &graphs[func_name];
-                let (mut out_sigs, constraints) =
-                    build_function_constraints_from_block_signatures(func_graph)?;
+            // analyze graphs
+            let analyzed: Option<HashMap<_, _>> = scc_original
+                .iter()
+                .map(|func_name| {
+                    let func_graph = &graphs[func_name];
+                    let (mut out_sigs, constraints) =
+                        build_function_constraints_from_block_signatures(func_graph)?;
 
-                let out_sig = out_sigs
-                    .remove(&0)
-                    .unwrap_or_else(|| {
-                        // this should be empty function
-                        assert_eq!(funcs[*func_name].len(), 0);
+                    let out_sig = out_sigs
+                        .remove(&0)
+                        .unwrap_or_else(|| {
+                            // this should be empty function
+                            assert_eq!(funcs[*func_name].len(), 0);
 
-                        Some(Z3Sig {
-                            delta: 0.into(),
-                            reach: 0.into(),
+                            Some(Z3Sig {
+                                delta: 0.into(),
+                                reach: 0.into(),
+                            })
                         })
-                    })
-                    .expect("Since Build completed");
+                        .expect("Since Build completed");
 
-                Some((*func_name, (out_sig, constraints)))
-            })
-            .collect();
+                    Some((*func_name, (out_sig, constraints)))
+                })
+                .collect();
 
-        // dbg!(&analyzed);
+            // dbg!(&analyzed);
 
-        out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
-            (
-                func_name,
-                func_graph
-                    .into_iter()
-                    .map(|(pos, (block, _))| (pos, block))
-                    .collect(),
-            )
-        }));
+            out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
+                (
+                    func_name,
+                    func_graph
+                        .into_iter()
+                        .map(|(pos, (block, _))| (pos, block))
+                        .collect(),
+                )
+            }));
 
-        // there was a function in thie SCC that could not be analyzed
-        let Some(analyzed) = analyzed else {
-            println!("ANALYSIS FAILED. Abandoning SCC {:?}", scc_signatures);
+            // there was a function in thie SCC that could not be analyzed
+            let Some(analyzed) = analyzed else {
+                println!("ANALYSIS FAILED. Abandoning SCC {:?}", scc_signatures);
 
-            continue 'outer;
-        };
+                continue 'outer;
+            };
 
-        analyzed
-            .into_iter()
-            .for_each(|(func_name, (out_sig, assertions))| {
-                assertions.iter().for_each(|bool| {
-                    solver.assert(bool);
+            analyzed
+                .into_iter()
+                .for_each(|(func_name, (out_sig, assertions))| {
+                    assertions.iter().for_each(|bool| {
+                        solver.assert(bool);
+                    });
+
+                    let z3sig = &scc_signatures[func_name];
+
+                    solver.assert(z3sig.delta.eq(out_sig.delta));
+                    solver.assert(z3sig.reach.eq(out_sig.reach));
+
+                    solver.minimize(&z3sig.reach);
                 });
 
-                let z3sig = &scc_signatures[func_name];
+            // println!("solving scc = {:?}", scc);
+            let z3::SatResult::Sat = solver.check(&[]) else {
+                println!("z3 COULD NOT SOLVE SCC: {:?}", scc_signatures);
+                continue 'outer;
+            };
 
-                solver.assert(z3sig.delta.eq(out_sig.delta));
-                solver.assert(z3sig.reach.eq(out_sig.reach));
+            let model = solver.get_model().unwrap();
 
-                solver.minimize(&z3sig.reach);
-            });
+            // add to known signatures
+            signatures.extend(scc_signatures.iter().map(|(func_name, z3sig)| {
+                let var_name = (*func_name, solve_sig(&model, &solver, z3sig));
+                // println!("Resolved {var_name:?}");
 
-        // println!("solving scc = {:?}", scc);
-        let z3::SatResult::Sat = solver.check(&[]) else {
-            println!("z3 COULD NOT SOLVE SCC: {:?}", scc_signatures);
-            continue 'outer;
-        };
-
-        let model = solver.get_model().unwrap();
-
-        // add to known signatures
-        signatures.extend(scc_signatures.iter().map(|(func_name, z3sig)| {
-            let var_name = (*func_name, solve_sig(&model, &solver, z3sig));
-            // println!("Resolved {var_name:?}");
-
-            var_name
-        }));
+                var_name
+            }));
+        }
     }
 
     println!(

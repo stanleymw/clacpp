@@ -1,11 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use ahash::{HashMap, HashMapExt};
 use cranelift::prelude::Signature;
 
 use crate::types::{self, BasicBlockInstr, CRANELIFT_VALUE, ControlFlowInstr, Instr};
-
-use rayon::prelude::*;
 
 use std::cmp::max;
 
@@ -146,11 +144,46 @@ pub(crate) fn analyze<'names>(
             .collect();
 
         // --- Do infinite-reach detection on the remaining reaches ---
-        let funcs_with_well_behaved_deltas_and_bounded_reaches: Vec<&str> = if false {
-            todo!()
-        } else {
-            funcs_with_well_behaved_deltas
-        };
+        // FIXME!!!: MAKE IT SO THAT WE CAN USE ACTUAL ISIZE EDGES INSTEAD OF F64 EDGES
+        // (petgraph's find_negative_cycle requires f64 edges)
+        let mut graph: petgraph::Graph<&str, f64> = petgraph::Graph::new();
+        let nodes: HashMap<&str, _> = funcs_with_well_behaved_deltas
+            .iter()
+            .map(|&name| (name, graph.add_node(name)))
+            .collect();
+        for caller_name in funcs_with_well_behaved_deltas {
+            for (callee_name, call_delta) in find_func_calls_with_deltas(
+                all_blocks
+                    .get(caller_name)
+                    .expect("Name should refer to function in funcs"),
+                &all_deltas,
+            ) {
+                graph.add_edge(
+                    *nodes.get(caller_name).expect(
+                        "Caller should have been included as a function with well-behaved delta",
+                    ),
+                    *nodes.get(callee_name).expect(
+                        "Callee should have been included as a function with well-behaved delta",
+                    ),
+                    call_delta as f64,
+                );
+            }
+        }
+        let funcs_with_well_behaved_deltas_and_bounded_reaches: Vec<&str> = nodes
+            .iter()
+            .filter_map(|(&name, &index)| {
+                if petgraph::algo::find_negative_cycle(&graph, index).is_some() {
+                    // If negative cycle, then its reach is unbounded,
+                    // and we don't include it in the filtered list
+                    all_reaches.insert(name, Reach::Unbounded);
+                    None
+                } else {
+                    // If no negative cycle, we continue to analyze it
+                    // in the next step
+                    Some(name)
+                }
+            })
+            .collect();
 
         // --- Repeatedly guess reaches for those that are neither not-well-behaved-delta nor infinite-reach ---
         let mut reach_guesses: Vec<(&str, Reach)> =
@@ -182,7 +215,7 @@ pub(crate) fn analyze<'names>(
     // Combine Deltas and Reaches into ResolvedSigs
     let all_sigs: HashMap<&str, ResolvedSig> = funcs
         .iter()
-        .flat_map(|(&func_name, _)| {
+        .filter_map(|(&func_name, _)| {
             delta_and_reach_to_resolved_sig(
                 all_deltas
                     .get(func_name)
@@ -191,13 +224,12 @@ pub(crate) fn analyze<'names>(
                     .get(func_name)
                     .expect("Function should have been analyzed for reach"),
             )
-            .map_or(vec![], |sig| vec![(func_name, sig)])
+            .map(|sig| (func_name, sig))
         })
         .collect();
 
     println!("--- Signatures Found ---");
     println!("{:#?}", all_sigs);
-    std::process::exit(0);
 
     // Return result
     AnalysisResult {
@@ -463,7 +495,6 @@ pub(crate) enum Reach {
 }
 
 fn combine_sequential_reaches((r1, d1): (Reach, Delta), r2: Reach) -> Reach {
-    use std::cmp::Ordering::*;
     match (r1, d1, r2) {
         (Reach::Num(r1), Delta::Num(d1), Reach::Num(r2)) => Reach::Num(max(
             r1,
@@ -542,6 +573,98 @@ fn find_func_reach(
     }
 
     path_reaches.get(&0).map_or(Reach::Num(0), Clone::clone)
+}
+
+fn basic_block_instr_to_calls_with_deltas<'a>(instr: &'a BasicBlockInstr) -> Vec<(&'a str, isize)> {
+    match instr {
+        BasicBlockInstr::FunctionCall(func_name_string) => vec![(func_name_string.as_str(), 0)],
+        _ => vec![],
+    }
+}
+
+// TODO: Eliminate unncessary duplicate edges
+
+fn combine_sequential_calls_with_deltas<'a>(
+    (c1, d1): (Vec<(&'a str, isize)>, Delta),
+    c2: Vec<(&'a str, isize)>,
+) -> Vec<(&'a str, isize)> {
+    match d1 {
+        Delta::Num(d1) => {
+            let mut result = c1;
+            result.extend(
+                c2.iter()
+                    .map(|&(name, d)| (name, d1 + d))
+                    .collect::<Vec<_>>(),
+            );
+            result
+        }
+        Delta::Never => c1,
+        Delta::NotWellBehaved => Vec::default(), // Dummy value (non-well-behaved behavior should not be reachable if we analyze a well-behaved function)
+    }
+}
+
+fn combine_branching_calls_with_deltas<'a>(
+    c1: Vec<(&'a str, isize)>,
+    c2: Vec<(&'a str, isize)>,
+) -> Vec<(&'a str, isize)> {
+    let mut result = c1;
+    result.extend(c2);
+    result
+}
+
+// TODO: Make the efficiency of this function (and others) better
+fn find_func_calls_with_deltas<'a>(
+    blocks: &'a BTreeMap<usize, Block>,
+    known_deltas: &HashMap<&str, Delta>,
+) -> Vec<(&'a str, isize)> {
+    let mut path_calls_with_deltas = BTreeMap::<usize, Vec<(&'a str, isize)>>::new();
+
+    for (&curr_pos, curr_block) in blocks.iter().rev() {
+        let calls_with_deltas_from_next = |next: &Next| -> Vec<(&'a str, isize)> {
+            match next {
+                // TODO remove expensive vector clone
+                Next::Block(next_pos) => path_calls_with_deltas.get(next_pos).expect("Referenced block's func calls with deltas should have already been analyzed").clone(),
+                Next::Terminate => vec![],
+                Next::Trap => vec![],
+            }
+        };
+
+        let terminator_calls_with_deltas = match &curr_block.terminator {
+            Terminator::Jump(next) => calls_with_deltas_from_next(next),
+            Terminator::If { on_true, on_false } => combine_sequential_calls_with_deltas(
+                (vec![], Delta::Num(-1)),
+                combine_branching_calls_with_deltas(
+                    calls_with_deltas_from_next(on_true),
+                    calls_with_deltas_from_next(on_false),
+                ),
+            ),
+            Terminator::Skip { targets } => combine_sequential_calls_with_deltas(
+                (vec![], Delta::Num(-1)),
+                targets.iter().map(calls_with_deltas_from_next).fold(
+                    calls_with_deltas_from_next(&Next::Trap),
+                    combine_branching_calls_with_deltas,
+                ),
+            ),
+        };
+
+        let curr_path_calls_with_deltas = curr_block
+            .code
+            .iter()
+            .map(|basic_block_instr| {
+                (
+                    basic_block_instr_to_calls_with_deltas(basic_block_instr),
+                    basic_block_instr.delta(&known_deltas),
+                )
+            })
+            .rev()
+            .fold(terminator_calls_with_deltas, |r, l| {
+                combine_sequential_calls_with_deltas(l, r)
+            });
+
+        path_calls_with_deltas.insert(curr_pos, curr_path_calls_with_deltas);
+    }
+
+    path_calls_with_deltas.get(&0).map_or(vec![], Clone::clone)
 }
 
 fn delta_and_reach_to_resolved_sig(d: &Delta, r: &Reach) -> Option<ResolvedSig> {

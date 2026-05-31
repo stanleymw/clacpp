@@ -1,7 +1,10 @@
-use std::{collections::BTreeMap, mem::transmute_copy, rc::Rc};
+use std::{collections::BTreeMap, io::Write, mem::transmute_copy, rc::Rc};
 
 use crate::{
-    jit::analysis::{self},
+    jit::{
+        analysis::{self, ResolvedSig},
+        inline,
+    },
     types::{
         self, ArithOp, BasicBlockInstr, CRANELIFT_VALUE, Compiler, FuncMap, Instr, JITFunction,
         MemOp,
@@ -11,7 +14,7 @@ use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use cranelift::{
     codegen::{
         control::ControlPlane,
-        ir::{FuncRef, InstructionData, Opcode, ValueDef},
+        ir::{BlockArg, FuncRef, InstructionData, Opcode, ValueDef},
     },
     frontend::Switch,
     prelude::{
@@ -23,6 +26,7 @@ use cranelift::{
 };
 
 use cranelift_jit::JITModule;
+use cranelift_object::object::Import;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use types::Value as ClacValue;
 
@@ -84,20 +88,31 @@ fn emit_pick(bu: &mut FunctionBuilder, stack: Variable, offset: Value) {
 }
 
 fn compile_block(
-    block: Rc<analysis::Block>,
-    stack: Variable,
+    idx: usize,
+    blocks: &BTreeMap<usize, UnifiedBlock>,
+    stack: Option<Variable>, // whether this exists will be used to determine whether we flush or not
     bu: &mut FunctionBuilder,
     isa: &dyn TargetIsa,
-    (funcs, calleemap): (&HashMap<&str, FuncId>, &HashMap<FuncId, FuncRef>),
+    refs: &ImportRefs,
     (trap_block, term_block): (cranelift::prelude::Block, cranelift::prelude::Block),
-    refs: &BuiltinRefs,
+    block_param_counts: &mut HashMap<usize, usize>,
 ) {
-    // dbg_println!("compiling block = {:?}", block);
+    let UnifiedBlock { code, cranelift }: &UnifiedBlock = blocks.get(&idx).unwrap();
 
-    // let cb = block.cranelift_block;
-    let cb = todo!();
+    let cb = *cranelift;
     bu.switch_to_block(cb);
     bu.seal_block(cb);
+
+    if stack.is_none() {
+        let Some(&paramc) = block_param_counts.get(&idx) else {
+            println!("[!] Block {idx}: {code:?} skipped because it is not reachable!");
+            return;
+        };
+
+        for _ in 0..paramc {
+            bu.append_block_param(cb, CRANELIFT_VALUE);
+        }
+    }
 
     // Idea:
     // 2 levels of stack
@@ -109,44 +124,75 @@ fn compile_block(
     // must also flush before Pick
     //
     // every function is fn(*mut ClacStack) -> *mut ClacStack
-    let mut tmp: Vec<Value> = Vec::new();
+    let mut tmp: Vec<Value> = match stack {
+        None => Vec::from(bu.block_params(cb)),
+        Some(_) => {
+            match idx {
+                0 => assert_eq!(bu.block_params(cb).len(), 1),
+                _ => assert_eq!(bu.block_params(cb).len(), 0),
+            }
 
-    let flush = |tmp: &mut Vec<Value>, bu: &mut FunctionBuilder| {
-        for val in tmp.iter() {
-            emit_push(bu, stack, *val);
+            Vec::new()
         }
-
-        tmp.clear();
     };
 
-    let xpop = |tmp: &mut Vec<Value>, bu: &mut FunctionBuilder| {
-        tmp.pop().unwrap_or_else(|| emit_pop(bu, stack))
+    dbg_println!(
+        "compiling block = {:?} | initial tmp = {:?} | block param counts = {block_param_counts:?}",
+        code,
+        tmp
+    );
+
+    let flush: Box<dyn Fn(&mut Vec<Value>, &mut FunctionBuilder) -> Vec<Value>> = match stack {
+        None => Box::new(|tmp, bu| std::mem::take(tmp)),
+        Some(stack) => Box::new(move |tmp, bu| {
+            let tmp = std::mem::take(tmp);
+
+            for val in tmp.into_iter() {
+                emit_push(bu, stack, val);
+            }
+
+            vec![bu.use_var(stack)]
+        }),
     };
 
-    let xpop_no_value = |tmp: &mut Vec<Value>, bu: &mut FunctionBuilder| {
-        tmp.pop().unwrap_or_else(|| emit_pop_loadless(bu, stack))
+    let xpop: Box<dyn Fn(&mut Vec<Value>, &mut FunctionBuilder) -> Value> = match stack {
+        None => Box::new(|tmp, bu| {
+            tmp.pop()
+                .expect("By Clacanalysis reach calculation, this should hold")
+        }),
+        Some(stack) => Box::new(move |tmp, bu| tmp.pop().unwrap_or_else(|| emit_pop(bu, stack))),
     };
 
-    let value_to_const =
-        |func: &cranelift::codegen::ir::Function, val: Value| -> Option<ClacValue> {
-            let valuedef = func.dfg.value_def(val);
+    let xpop_no_value: Box<dyn Fn(&mut Vec<Value>, &mut FunctionBuilder)> = match stack {
+        None => Box::new(|tmp, bu| {
+            tmp.pop()
+                .expect("By Clacanalysis reach calculation, this should hold");
+        }),
+        Some(stack) => Box::new(move |tmp, bu| {
+            tmp.pop().unwrap_or_else(|| emit_pop_loadless(bu, stack));
+        }),
+    };
 
-            let ValueDef::Result(inst, 0) = valuedef else {
-                return None;
-            };
+    // let value_to_const =
+    //     |func: &cranelift::codegen::ir::Function, val: Value| -> Option<ClacValue> {
+    //         let valuedef = func.dfg.value_def(val);
 
-            let res = func.dfg.insts[inst];
-            let InstructionData::UnaryImm {
-                opcode: Opcode::Iconst,
-                imm: num,
-            } = res
-            else {
-                return None;
-            };
-            Some(num.into())
-        };
+    //         let ValueDef::Result(inst, 0) = valuedef else {
+    //             return None;
+    //         };
 
-    let line = block.code;
+    //         let res = func.dfg.insts[inst];
+    //         let InstructionData::UnaryImm {
+    //             opcode: Opcode::Iconst,
+    //             imm: num,
+    //         } = res
+    //         else {
+    //             return None;
+    //         };
+    //         Some(num.into())
+    //     };
+
+    let line = &code.code;
 
     for (i, inst) in line.iter().enumerate() {
         match inst {
@@ -169,7 +215,7 @@ fn compile_block(
                         bu.ins().sextend(CRANELIFT_VALUE, cmp)
                     }
                     ArithOp::Pow => {
-                        let call = bu.ins().call(refs.powfunc, &[a, b]);
+                        let call = bu.ins().call(refs.builtins.powfunc, &[a, b]);
                         bu.inst_results(call)[0]
                     }
                 });
@@ -195,14 +241,14 @@ fn compile_block(
             }
             BasicBlockInstr::Print => {
                 let popped = xpop(&mut tmp, bu);
-                bu.ins().call(refs.printfunc, &[popped]);
+                bu.ins().call(refs.builtins.printfunc, &[popped]);
             }
             BasicBlockInstr::Quit => {
-                bu.ins().call(refs.quitfunc, &[]);
+                // TODO: this should be a terminator/no return
+                bu.ins().call(refs.builtins.quitfunc, &[]);
             }
             &BasicBlockInstr::ResolvedPick(n) => {
                 // assert_eq!(value_to_const(bu.func, tmp.pop().unwrap()).unwrap(), n);
-
                 // let n: usize = n.try_into().unwrap();
 
                 // TODO: turn this into trap otherwise
@@ -211,6 +257,9 @@ fn compile_block(
                 if n <= tmp.len() {
                     tmp.push(tmp[tmp.len() - n]);
                 } else {
+                    let stack =
+                        stack.expect("This case should not occur if Clacanalysis worked correctly");
+
                     let amt: i64 = (n - tmp.len()).try_into().unwrap();
                     assert!(amt > 0);
 
@@ -222,6 +271,8 @@ fn compile_block(
                 }
             }
             BasicBlockInstr::BadPick => {
+                let stack = stack.expect("This must be a not well-behaved function");
+
                 let popped = xpop(&mut tmp, bu);
 
                 // TODO: improve
@@ -230,34 +281,73 @@ fn compile_block(
                 emit_pick(bu, stack, popped);
             }
             BasicBlockInstr::FunctionCall(func) => {
-                let Some(func) = funcs.get(func.as_str()) else {
+                let Some((callee_ref, callee_sig)) = refs.clac.0.get(func.as_str()) else {
                     dbg_println!("TRYING TO CALL UNRESOLVED FUNCTION: {func:?}");
                     bu.ins().trap(TrapCode::unwrap_user(67));
                     return;
                 };
 
-                let func = calleemap[func];
+                let args: Vec<_> = match callee_sig {
+                    Some(callee_sig) => {
+                        let argc = callee_sig.argc();
 
-                flush(&mut tmp, bu);
-                let final_stack = bu.use_var(stack);
+                        let mut out: Vec<_> = (0..argc).map(|_| xpop(&mut tmp, bu)).collect();
+                        out.reverse();
+                        out
+                    }
+                    None => {
+                        let stack = stack.expect(
+                            "A well behaved function cannot call non-well-behaved functions",
+                        );
 
-                // if i == line.len() - 1 && is_last_block {
-                //     bu.ins().return_call(*func, &[final_stack]);
-                //     return;
-                // }
+                        flush(&mut tmp, bu)
+                    }
+                };
 
                 // TAIL CALL OPTIMIZATION
-                if i == line.len() - 1
-                    && let analysis::Terminator::Jump(analysis::Next::Terminate) = block.terminator
+                let tailcall_candidate = match (stack, callee_sig) {
+                    // Well CALLS well OK only when tmp.len() == 0
+                    (None, Some(_)) if tmp.len() == 0 => true,
+
+                    // Bad Calls Bad OK
+                    (Some(_), None) => true,
+
+                    // Bad Calls Well -- Won't work
+                    // Well Calls Bad -- IMPOSSIBLE
+                    _ => false,
+                };
+
+                if tailcall_candidate
+                    && i == line.len() - 1
+                    && let analysis::Terminator::Jump(analysis::Next::Terminate) = code.terminator
                 {
-                    bu.ins().return_call(func, &[final_stack]);
+                    assert_eq!(tmp.len(), 0);
+
+                    bu.ins().return_call(*callee_ref, &args);
                     return;
                 }
 
-                let ret = bu.ins().call(func, &[final_stack]);
-                // update stack
-                let ret = bu.inst_results(ret)[0];
-                bu.def_var(stack, ret);
+                let ret = bu.ins().call(*callee_ref, &args);
+                match callee_sig {
+                    Some(callee_sig) => {
+                        tmp.extend(bu.inst_results(ret));
+
+                        // CALLEE is never type, so any code after this should be unreachable. So, let's just insert a trap (should never be reached) and finish the block
+                        if callee_sig.delta.is_none() {
+                            bu.ins().trap(TrapCode::unwrap_user(68));
+                            return;
+                        }
+                    }
+                    None => {
+                        let stack = stack.expect(
+                            "A well behaved function cannot call non-well-behaved functions",
+                        );
+
+                        // update stack
+                        let ret = bu.inst_results(ret)[0];
+                        bu.def_var(stack, ret);
+                    }
+                }
             }
             BasicBlockInstr::Mem(memop) => {
                 match memop {
@@ -336,9 +426,9 @@ fn compile_block(
                 // };
 
                 // TODO: maybe can remove flush?
-                flush(&mut tmp, bu);
-
-                let rsp = bu.use_var(stack);
+                // flush(&mut tmp, bu);
+                let stack = stack.expect("this should be a bad (not well-behaved) function");
+                let rsp = flush(&mut tmp, bu)[0];
 
                 let drop_start = bu.ins().isub(rsp, start_strided);
                 let drop_end = bu.ins().iadd(drop_start, amount_strided);
@@ -369,61 +459,113 @@ fn compile_block(
                 let v1 = xpop(&mut tmp, bu);
                 let rax = xpop(&mut tmp, bu);
 
-                let sysc = bu.ins().call(refs.syscall, &[rax, v1, v2, v3, v4, v5, v6]);
+                let sysc = bu
+                    .ins()
+                    .call(refs.builtins.syscall, &[rax, v1, v2, v3, v4, v5, v6]);
 
                 tmp.push(bu.inst_results(sysc)[0]);
             }
         }
     }
 
+    let cache_param_count = |bpc: &mut HashMap<usize, usize>, block: usize, count: usize| {
+        bpc.entry(block)
+            .and_modify(|old| assert_eq!(*old, count))
+            .or_insert(count);
+    };
+
     // build terminator
-    let mut build_return = |bu: &mut FunctionBuilder, next: &analysis::Next| {
-        flush(&mut tmp, bu);
-        match next {
-            analysis::Next::Trap => {
-                bu.ins().trap(TrapCode::unwrap_user(67));
+    // let mut build_return = |bu: &mut FunctionBuilder, next: &analysis::Next| ;
+
+    let mut get_block_and_args =
+        |next: &analysis::Next, bu: &mut FunctionBuilder, args: &[BlockArg]| {
+            match next {
+                analysis::Next::Trap => (trap_block, vec![]), // TODO: fix
+                analysis::Next::Terminate => (term_block, Vec::from(args)),
+                analysis::Next::Block(block) => {
+                    cache_param_count(block_param_counts, *block, args.len());
+                    (
+                        blocks[block].cranelift,
+                        if stack.is_none() {
+                            Vec::from(args)
+                        } else {
+                            vec![]
+                        },
+                    )
+                }
             }
-            analysis::Next::Terminate => {
-                let final_stack = bu.use_var(stack);
-                bu.ins().return_(&[final_stack]);
-            }
-            analysis::Next::Block(block) => {
-                // bu.ins().jump(block.cranelift_block, &[]);
-                bu.ins().jump(todo!(), &[]);
+        };
+
+    match &code.terminator {
+        analysis::Terminator::Jump(next) => {
+            match next {
+                analysis::Next::Trap => {
+                    bu.ins().trap(TrapCode::unwrap_user(67));
+                }
+                analysis::Next::Terminate => {
+                    let out = &flush(&mut tmp, bu);
+                    bu.ins().return_(out);
+                }
+                analysis::Next::Block(block) => {
+                    let cranelifted = blocks[block].cranelift;
+
+                    let out: Vec<_> = flush(&mut tmp, bu)
+                        .into_iter()
+                        .map(|x| BlockArg::Value(x))
+                        .collect();
+
+                    cache_param_count(block_param_counts, *block, out.len());
+
+                    // TODO: this may add extraneous block arguments
+                    bu.ins().jump(
+                        cranelifted,
+                        if stack.is_none() { out.as_slice() } else { &[] },
+                    );
+                }
             }
         }
-    };
-
-    let get_block = |next: &analysis::Next| match next {
-        analysis::Next::Trap => trap_block,
-        analysis::Next::Terminate => term_block,
-        // analysis::Next::Block(block) => block.cranelift_block,
-        analysis::Next::Block(block) => todo!(),
-    };
-
-    match &block.terminator {
-        analysis::Terminator::Jump(next) => build_return(bu, next),
         analysis::Terminator::If { on_true, on_false } => {
-            let on_true = get_block(on_true);
-            let on_false = get_block(on_false);
-
             let cond = xpop(&mut tmp, bu);
 
-            flush(&mut tmp, bu);
-            bu.ins().brif(cond, on_true, &[], on_false, &[]);
+            let out: Vec<_> = flush(&mut tmp, bu)
+                .into_iter()
+                .map(|x| BlockArg::Value(x))
+                .collect();
+
+            let (on_true, on_true_args) = get_block_and_args(on_true, bu, &out);
+            let (on_false, on_false_args) = get_block_and_args(on_false, bu, &out);
+
+            bu.ins()
+                .brif(cond, on_true, &on_true_args, on_false, &on_false_args);
         }
         analysis::Terminator::Skip { targets } => {
             let mut switch = Switch::new();
 
-            let targets: Vec<_> = targets.into_iter().map(get_block).collect();
-            for (i, block) in targets.into_iter().enumerate() {
-                switch.set_entry(i as u128, block);
-            }
-
             let popped = xpop(&mut tmp, bu);
 
-            flush(&mut tmp, bu);
+            let out: Vec<_> = flush(&mut tmp, bu)
+                .into_iter()
+                .map(|x| BlockArg::Value(x))
+                .collect();
+
+            let targets: Vec<_> = targets
+                .into_iter()
+                .map(|nx| (get_block_and_args(nx, bu, &out), bu.create_block()))
+                .collect();
+
+            for (i, (_, trampoline)) in targets.iter().enumerate() {
+                switch.set_entry(i as u128, *trampoline);
+            }
             switch.emit(bu, popped, trap_block);
+
+            // seal trampolines
+            targets
+                .into_iter()
+                .for_each(|((real_block, args), trampoline)| {
+                    bu.switch_to_block(trampoline);
+                    bu.ins().jump(real_block, &args);
+                    bu.seal_block(trampoline);
+                });
         }
     }
 }
@@ -461,11 +603,13 @@ pub(crate) fn get_function(module: &JITModule, func: FuncId) -> JITFunction {
 }
 
 #[derive(Debug)]
-pub(crate) struct Callees<'names>(HashMap<&'names str, FuncRef>);
+pub(crate) struct Callees<'names, 'sigs>(
+    HashMap<&'names str, (FuncRef, Option<&'sigs analysis::ResolvedSig>)>,
+);
 
 #[derive(Debug)]
-pub struct ImportRefs<'names> {
-    clac: Callees<'names>,
+pub struct ImportRefs<'names, 'sigs> {
+    clac: Callees<'names, 'sigs>,
     builtins: BuiltinRefs,
 }
 
@@ -479,6 +623,11 @@ fn get_callees(line: &[types::Instr]) -> HashSet<&str> {
             Some(funcref.as_str())
         })
         .collect()
+}
+
+struct UnifiedBlock {
+    code: analysis::Block,
+    cranelift: cranelift::prelude::Block,
 }
 
 impl<T: Module> Compiler<T> {
@@ -504,6 +653,7 @@ impl<T: Module> Compiler<T> {
         &mut self,
         name: &str,
         to_wrap: FuncId,
+        target_sig: Option<&ResolvedSig>,
         ctx: &mut cranelift::codegen::Context,
         fbctx: &mut FunctionBuilderContext,
     ) -> ModuleResult<FuncId> {
@@ -522,14 +672,37 @@ impl<T: Module> Compiler<T> {
         let entry = bu.create_block();
         bu.switch_to_block(entry);
         bu.seal_block(entry);
+
         bu.append_block_params_for_function_params(entry);
 
         let stack = bu.block_params(entry)[0];
 
-        let ret = bu.ins().call(target, &[stack]);
-        let ret = bu.inst_results(ret)[0];
+        match target_sig {
+            None => {
+                let ret = bu.ins().call(target, &[stack]);
+                let ret: Vec<_> = Vec::from(bu.inst_results(ret));
 
-        bu.ins().return_(&[ret]);
+                bu.ins().return_(&ret);
+            }
+            Some(target_sig) => {
+                let argc = target_sig.argc();
+
+                let stack_var = bu.declare_var(self.module.isa().pointer_type());
+                bu.def_var(stack_var, stack);
+
+                let mut args: Vec<_> = (0..argc).map(|_| emit_pop(&mut bu, stack_var)).collect();
+                args.reverse();
+
+                let ret = bu.ins().call(target, &args);
+                let ret = Vec::from(bu.inst_results(ret));
+
+                ret.into_iter()
+                    .for_each(|x| emit_push(&mut bu, stack_var, x));
+
+                let final_stack_var = bu.use_var(stack_var);
+                bu.ins().return_(&[final_stack_var]);
+            }
+        }
 
         bu.finalize();
 
@@ -539,7 +712,7 @@ impl<T: Module> Compiler<T> {
     }
 
     pub fn compile_function(
-        (function, signature): &analysis::AnalyzedFunction,
+        (function, signature): (BTreeMap<usize, analysis::Block>, Option<&ResolvedSig>),
         mut ctx: cranelift::codegen::Context,
         import_refs: ImportRefs,
         isa: &dyn TargetIsa,
@@ -551,18 +724,28 @@ impl<T: Module> Compiler<T> {
         let mut fbctx = FunctionBuilderContext::new();
 
         // TODO: fix when better function analysis is added
-        ctx.func.signature = signature.as_ref().map_or_else(
+        ctx.func.signature = signature.map_or_else(
             || generate_clac_function_signature(isa, CallConv::Tail),
             |x| x.to_cranelift_signature(CallConv::Tail),
         );
 
-        dbg_println!("Callees = {:?}", callees);
-
         let mut bu = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
-        // let analyzed = analysis::create_graph(function, &mut bu);
-        let analyzed: HashMap<usize, _> = todo!();
 
-        let Some(entry) = analyzed.get(&0) else {
+        let function: BTreeMap<_, _> = function
+            .into_iter()
+            .map(|(pos, block)| {
+                (
+                    pos,
+                    UnifiedBlock {
+                        code: block,
+                        cranelift: bu.create_block(),
+                    },
+                )
+            })
+            .collect();
+
+        let Some(entry) = function.get(&0) else {
+            // create identity block
             let x = bu.create_block();
 
             bu.switch_to_block(x);
@@ -570,9 +753,8 @@ impl<T: Module> Compiler<T> {
 
             bu.seal_block(x);
 
-            let stack = bu.block_params(x)[0];
-
-            bu.ins().return_(&[stack]);
+            let block_params = Vec::from(bu.block_params(x));
+            bu.ins().return_(&block_params);
 
             bu.finalize();
 
@@ -583,44 +765,71 @@ impl<T: Module> Compiler<T> {
 
         // dbg_println!("entry = {:?}", entry);
 
-        // let cb = entry.cranelift_block;
-        let cb = todo!();
+        let entry_block = entry.cranelift;
 
-        bu.append_block_params_for_function_params(cb);
-        bu.switch_to_block(cb);
+        bu.append_block_params_for_function_params(entry_block);
+        bu.switch_to_block(entry_block);
 
-        let stack = bu.block_params(cb)[0];
+        // TODO: there should be a better way of ensuring that entry is actually the entry
+        bu.func.layout.append_block(entry_block);
 
-        let stack_var = bu.declare_var(isa.pointer_type());
-        bu.def_var(stack_var, stack);
+        let stack = match signature {
+            None => {
+                let entry_block_params = bu.block_params(entry_block);
+                assert_eq!(entry_block_params.len(), 1);
 
-        let stack = stack_var;
+                let stack = bu.block_params(entry_block)[0];
+                let stack_var = bu.declare_var(isa.pointer_type());
+                bu.def_var(stack_var, stack);
 
-        let (trap_block, term_block) = (bu.create_block(), bu.create_block());
+                Some(stack_var)
+            }
+            Some(_) => None,
+        };
 
-        for (_, block) in analyzed {
+        let trap_block = bu.create_block();
+        let term_block = bu.create_block();
+
+        let retc = signature.map_or(1, |x| x.retc());
+
+        for _ in 0..retc {
+            bu.append_block_param(term_block, CRANELIFT_VALUE);
+        }
+
+        let mut block_param_counts: HashMap<usize, usize> = HashMap::new();
+        // NOTE: since we do append block params for func params, we don't need to do any additional appends for the entry block
+        block_param_counts.insert(0, 0);
+
+        for (idx, _) in function.iter() {
             compile_block(
-                block,
+                *idx,
+                &function,
                 stack,
                 &mut bu,
                 isa,
-                (todo!(), todo!()),
+                &import_refs,
                 (trap_block, term_block),
-                todo!(),
+                &mut block_param_counts,
             );
         }
 
-        // create trap and term block
-        bu.switch_to_block(trap_block);
-        bu.ins().trap(TrapCode::unwrap_user(67));
         bu.seal_block(trap_block);
-
-        bu.switch_to_block(term_block);
-        let stack_final = bu.use_var(stack);
-        bu.ins().return_(&[stack_final]);
         bu.seal_block(term_block);
 
+        // build trap block
+        bu.switch_to_block(trap_block);
+        bu.ins().trap(TrapCode::unwrap_user(67));
+
+        // build term block
+        bu.switch_to_block(term_block);
+        let params = Vec::from(bu.block_params(term_block));
+        bu.ins().return_(&params);
+
+        println!("ctx func display: {}", bu.func.display());
+
         bu.finalize();
+
+        // ctx.inline(inline::ClacInliner {});
 
         Ok(ctx)
     }
@@ -631,25 +840,12 @@ impl<T: Module> Compiler<T> {
         mut self,
         funcs: &types::FuncMap,
     ) -> Result<(T, HashMap<String, FuncId>), CompilerError> {
-        let tail = self.generate_signature(cranelift::prelude::isa::CallConv::Tail);
-
         let types::Imports {
             printfunc,
             quitfunc,
             powfunc,
             syscallfunc,
         } = self.imports;
-
-        // assign cranelift FuncIDs
-        let declared: HashMap<&str, FuncId> = funcs
-            .iter()
-            .map(|(name, _)| {
-                (
-                    name.as_str(),
-                    self.module.declare_anonymous_function(&tail).unwrap(),
-                )
-            })
-            .collect();
 
         let mut graph: petgraph::Graph<&str, ()> = petgraph::Graph::new();
 
@@ -691,18 +887,33 @@ impl<T: Module> Compiler<T> {
             .map(|(a, b)| (a.as_str(), b.as_slice()))
             .collect();
 
-        let resolved = analysis::analyze(&graph, &funcs2);
-
-        dbg!(&resolved);
-
-        todo!();
+        let analysis::AnalysisResult {
+            code: mut function_cfgs,
+            resolved_sigs,
+        } = analysis::analyze(&graph, &funcs2);
 
         // let x = petgraph::dot::Dot::with_config(&graph, &[]);
         // let out = format!("{:?}", x);
         // let mut file = std::fs::File::create("graph.dot").unwrap();
         // file.write_all(out.as_bytes()).unwrap();
 
-        let metadata_map: HashMap<&str, _> = callee_map
+        // assign cranelift FuncIDs
+        let declared: HashMap<&str, FuncId> = funcs
+            .iter()
+            .map(|(name, _)| {
+                let sig = resolved_sigs.get(name.as_str()).map_or_else(
+                    || self.generate_signature(CallConv::Tail),
+                    |x| x.to_cranelift_signature(CallConv::Tail),
+                );
+
+                (
+                    name.as_str(),
+                    self.module.declare_anonymous_function(&sig).unwrap(),
+                )
+            })
+            .collect();
+
+        let combined_map: HashMap<&str, _> = callee_map
             .into_iter()
             .map(|(name, callees)| {
                 let mut ctx = self.module.make_context();
@@ -712,11 +923,14 @@ impl<T: Module> Compiler<T> {
                     .map(|callee| {
                         (
                             callee,
-                            self.module.declare_func_in_func(
-                                *declared
-                                    .get(callee)
-                                    .expect("callees should only have valid callees"),
-                                &mut ctx.func,
+                            (
+                                self.module.declare_func_in_func(
+                                    *declared
+                                        .get(callee)
+                                        .expect("callees should only have valid callees"),
+                                    &mut ctx.func,
+                                ),
+                                resolved_sigs.get(callee),
                             ),
                         )
                     })
@@ -737,20 +951,26 @@ impl<T: Module> Compiler<T> {
                             builtins,
                         },
                         ctx,
+                        function_cfgs.remove(name).unwrap(),
                     ),
                 )
             })
             .collect();
 
+        assert_eq!(function_cfgs.len(), 0);
+
         let isa = self.module.isa();
 
-        let res: HashMap<_, _> = metadata_map
-            .into_par_iter()
-            .map(|(func_name, (import_refs, ctx))| {
-                let analyzed = resolved.get(func_name).unwrap();
-
-                let mut translated =
-                    Self::compile_function(analyzed, ctx, import_refs, isa).unwrap();
+        let res: HashMap<_, _> = combined_map
+            .into_iter()
+            .map(|(func_name, (import_refs, ctx, cfg))| {
+                let mut translated = Self::compile_function(
+                    (cfg, resolved_sigs.get(func_name)),
+                    ctx,
+                    import_refs,
+                    isa,
+                )
+                .unwrap();
 
                 translated
                     .compile(isa, &mut ControlPlane::default())
@@ -796,7 +1016,8 @@ impl<T: Module> Compiler<T> {
             .map(|(name, id)| {
                 (
                     name.to_string(),
-                    self.define_wrapper(name, id, &mut ctx, &mut fbctx).unwrap(),
+                    self.define_wrapper(name, id, resolved_sigs.get(name), &mut ctx, &mut fbctx)
+                        .unwrap(),
                 )
             })
             .collect();

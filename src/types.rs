@@ -443,6 +443,8 @@ impl Compiler<JITModule> {
                 ("enable_alias_analysis", "true"),
                 // TODO: remove this if we can do tailcalls without it
                 ("preserve_frame_pointers", "true"),
+                // FIXME: this is a deprecated option, and requires changing a lot of stuff in clac jit
+                ("enable_multi_ret_implicit_sret", "true"),
             ],
             cranelift_module::default_libcall_names(),
         )?;

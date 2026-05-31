@@ -1,11 +1,8 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::Deref,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use ahash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use cranelift::prelude::Signature;
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use petgraph::{algo::is_cyclic_directed, visit::NodeCount};
 
 macro_rules! dbg_println {
     ($($args:tt)*) => {
@@ -38,20 +35,22 @@ pub struct ResolvedSig {
 }
 
 impl ResolvedSig {
+    pub fn argc(&self) -> usize {
+        self.reach
+    }
+
+    pub fn retc(&self) -> usize {
+        let amt = self.delta.map_or(0, |delta| (self.reach as i64) + delta);
+        usize::try_from(amt).expect("By Clac++ theorem")
+    }
+
     pub fn to_cranelift_signature(
         &self,
         call_conv: cranelift::prelude::isa::CallConv,
     ) -> Signature {
         Signature {
-            params: vec![cranelift::prelude::AbiParam::new(CRANELIFT_VALUE); self.reach],
-            returns: {
-                let amt = self.delta.map_or(0, |delta| (self.reach as i64) + delta);
-
-                vec![
-                    cranelift::prelude::AbiParam::new(CRANELIFT_VALUE);
-                    usize::try_from(amt).expect("By Clac++ theorem")
-                ]
-            },
+            params: vec![cranelift::prelude::AbiParam::new(CRANELIFT_VALUE); self.argc()],
+            returns: vec![cranelift::prelude::AbiParam::new(CRANELIFT_VALUE); self.retc()],
 
             call_conv,
         }
@@ -241,7 +240,7 @@ fn solve_reach(model: &z3::Model, reach: &Z3Int) -> usize {
 
 fn solve_sig(
     model: &z3::Model,
-    solver: &z3::Solver,
+    solver: &z3::Optimize,
     Z3Sig { delta, reach }: &Z3Sig,
 ) -> ResolvedSig {
     let mut delta_n: Option<i64> = model.eval(delta, false).and_then(|x| {
@@ -254,7 +253,7 @@ fn solve_sig(
         solver.push();
         solver.assert(delta.eq(val + 67));
 
-        let unbounded = solver.check() == z3::SatResult::Sat;
+        let unbounded = solver.check(&[]) == z3::SatResult::Sat;
         if unbounded {
             assert_eq!(
                 val + 67,
@@ -271,7 +270,7 @@ fn solve_sig(
             println!("{delta} is unbounded")
         }
 
-        solver.pop(1);
+        solver.pop();
     };
 
     let reach = solve_reach(model, reach);
@@ -282,31 +281,88 @@ fn solve_sig(
     }
 }
 
-pub type AnalyzedFunction = (
-    BTreeMap<usize, Block>, // function code
-    Option<ResolvedSig>, // resolved sig of the function. If is some variant, then this function is well behaved. As in, no matter the control flow path it takes to the end, it ultimately has the same stack delta.
-                         // TODO: prove theorem where in all well defined functions, all entrypoints to any given block must have the same stack delta
-);
+pub struct AnalysisResult<'names> {
+    /// CFG of functions
+    pub code: HashMap<&'names str, BTreeMap<usize, Block>>,
 
-pub type ResolvedInner<'names> = HashMap<&'names str, AnalyzedFunction>;
+    // resolved sig of the functions. The functions here are well behaved. As in, no matter the control flow path it takes to the end, it ultimately has the same stack delta.
+    // TODO: prove theorem where in all well defined functions, all entrypoints to any given block must have the same stack delta
+    pub resolved_sigs: HashMap<&'names str, ResolvedSig>,
+}
 
-#[derive(Debug)]
-pub struct ResolvedFuncMap<'names>(ResolvedInner<'names>);
+fn layered_toposort<'names, 'sccs>(
+    graph: &'sccs petgraph::Graph<Vec<&'names str>, ()>,
+) -> Vec<Vec<petgraph::graph::NodeIndex>> {
+    debug_assert_eq!(is_cyclic_directed(graph), false);
 
-impl<'x> Deref for ResolvedFuncMap<'x> {
-    type Target = ResolvedInner<'x>;
+    let mut out = Vec::new();
+    let mut unresolved_dependencies: HashMap<_, _> = HashMap::new();
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    // initial layer (root nodes / functions with NO callees)
+    let mut layer: Vec<_> = Vec::with_capacity(
+        graph.node_count() / 3, // heuristic based off of observing real world programs
+    );
+
+    for node in graph.node_indices() {
+        let deps = graph
+            .neighbors_directed(node, petgraph::Direction::Incoming)
+            .count();
+
+        unresolved_dependencies.insert(node, deps);
+        if deps == 0 {
+            layer.push(node);
+        }
     }
+
+    let mut unresolved_dependencies: HashMap<_, _> = graph
+        .node_indices()
+        .map(|node| {
+            (
+                node,
+                graph
+                    .neighbors_directed(node, petgraph::Direction::Incoming)
+                    .count(),
+            )
+        })
+        .collect();
+
+    let mut added_sccs = 0;
+
+    while !layer.is_empty() {
+        let mut next_layer = HashSet::new();
+
+        // for everything that depends on the nodes in this layer, we can remove one from their dependencies
+        for node in &layer {
+            debug_assert_eq!(unresolved_dependencies[node], 0);
+
+            for successor in graph.neighbors(*node) {
+                let deps = unresolved_dependencies.get_mut(&successor).unwrap();
+                // should not underflow
+                *deps -= 1;
+
+                if *deps == 0 {
+                    next_layer.insert(successor);
+                }
+            }
+        }
+
+        // update layer
+        let to_push: Vec<_> = std::mem::replace(&mut layer, next_layer.into_iter().collect());
+
+        added_sccs += to_push.len();
+        out.push(to_push);
+    }
+
+    debug_assert_eq!(added_sccs, graph.node_count());
+
+    out
 }
 
 pub(crate) fn analyze<'names, 'instrs>(
     graph: &petgraph::Graph<Vec<&'names str>, ()>,
     funcs: &HashMap<&str, &'instrs [types::Instr]>,
-) -> ResolvedFuncMap<'names> {
-    let sort = petgraph::algo::toposort(graph, None)
-        .expect("graph should not have any cycles. Make sure it is condensed");
+) -> AnalysisResult<'names> {
+    let sort = layered_toposort(graph);
 
     // functions with resolved signatures. In any specific SCC, all dependencies (any nodes that come before this scc in the topological sort) should have their signatures in here, given that they are resolvable.
     let mut signatures: HashMap<&str, ResolvedSig> = HashMap::new();
@@ -314,113 +370,121 @@ pub(crate) fn analyze<'names, 'instrs>(
     // functions and code
     let mut out: HashMap<&str, BTreeMap<usize, Block>> = HashMap::new();
 
-    // TODO: implement layered topological sort for parallelism
-    'outer: for scc in sort {
-        // set up Z3 solver for this scc
-        let pipeline = Tactic::new("simplify")
-            .and_then(&Tactic::new("solve-eqs"))
-            .and_then(&Tactic::new("smt"));
+    // TODO: implement parallelism
+    for layer in sort {
+        // every scc in this layer should be done in parallel
+        'outer: for scc in layer {
+            // set up Z3 solver for this scc
+            // let pipeline = Tactic::new("simplify")
+            //     .and_then(&Tactic::new("solve-eqs"))
+            //     .and_then(&Tactic::new("smt"));
 
-        let solver = pipeline.solver();
+            // let solver = pipeline.optimize();
+            let solver = z3::Optimize::new();
 
-        let scc_original = &graph[scc];
+            let scc_original = &graph[scc];
 
-        // create z3 signatures
-        let scc_signatures: HashMap<_, _> = scc_original
-            .iter()
-            .map(|&func| {
-                (
-                    func,
-                    Z3Sig {
-                        delta: Z3Int::new_const(format!("{func}_delta")),
-                        reach: Z3Int::new_const(format!("{func}_reach")),
-                    },
-                )
-            })
-            .collect();
+            // create z3 signatures
+            let scc_signatures: HashMap<_, _> = scc_original
+                .iter()
+                .map(|&func| {
+                    (
+                        func,
+                        Z3Sig {
+                            delta: Z3Int::new_const(format!("{func}_delta")),
+                            reach: Z3Int::new_const(format!("{func}_reach")),
+                        },
+                    )
+                })
+                .collect();
 
-        // create graphs
-        let graphs: HashMap<_, _> = scc_original
+            // create graphs
+            let graphs: HashMap<_, _> = scc_original
             .iter()
             .map(|&func_name| {
                 let func_graph =
                     // TODO: separate the z3 signature part
-                    create_graph(funcs.get(func_name).unwrap(), &signatures, &scc_signatures);
+                    function_to_basic_blocks(funcs.get(func_name).unwrap(), &signatures, &scc_signatures);
 
                 (func_name, func_graph)
             })
             .collect();
 
-        // analyze graphs
-        let analyzed: Option<HashMap<_, _>> = scc_original
-            .iter()
-            .map(|func_name| {
-                let func_graph = &graphs[func_name];
-                let (mut out_sigs, constraints) =
-                    build_function_constraints_from_block_signatures(func_graph)?;
+            // analyze graphs
+            let analyzed: Option<HashMap<_, _>> = scc_original
+                .iter()
+                .map(|func_name| {
+                    let func_graph = &graphs[func_name];
+                    let (mut out_sigs, constraints) =
+                        build_function_constraints_from_block_signatures(func_graph)?;
 
-                let out_sig = out_sigs
-                    .remove(&0)
-                    .unwrap_or_else(|| {
-                        // this should be empty function
-                        assert_eq!(funcs[*func_name].len(), 0);
+                    let out_sig = out_sigs
+                        .remove(&0)
+                        .unwrap_or_else(|| {
+                            // this should be empty function
+                            assert_eq!(funcs[*func_name].len(), 0);
 
-                        Some(Z3Sig {
-                            delta: 0.into(),
-                            reach: 0.into(),
+                            Some(Z3Sig {
+                                delta: 0.into(),
+                                reach: 0.into(),
+                            })
                         })
-                    })
-                    .expect("Since Build completed");
+                        .expect("Since Build completed");
 
-                Some((*func_name, (out_sig, constraints)))
-            })
-            .collect();
+                    Some((*func_name, (out_sig, constraints)))
+                })
+                .collect();
 
-        out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
-            (
-                func_name,
-                func_graph
-                    .into_iter()
-                    .map(|(pos, (block, _))| (pos, block))
-                    .collect(),
-            )
-        }));
+            // dbg!(&analyzed);
 
-        // there was a function in thie SCC that could not be analyzed
-        let Some(analyzed) = analyzed else {
-            println!("ANALYSIS FAILED. Abandoning SCC {:?}", scc_signatures);
+            out.extend(graphs.into_iter().map(|(func_name, func_graph)| {
+                (
+                    func_name,
+                    func_graph
+                        .into_iter()
+                        .map(|(pos, (block, _))| (pos, block))
+                        .collect(),
+                )
+            }));
 
-            continue 'outer;
-        };
+            // there was a function in thie SCC that could not be analyzed
+            let Some(analyzed) = analyzed else {
+                println!("ANALYSIS FAILED. Abandoning SCC {:?}", scc_signatures);
 
-        analyzed
-            .into_iter()
-            .for_each(|(func_name, (out_sig, assertions))| {
-                assertions.iter().for_each(|bool| {
-                    solver.assert(bool);
+                continue 'outer;
+            };
+
+            analyzed
+                .into_iter()
+                .for_each(|(func_name, (out_sig, assertions))| {
+                    assertions.iter().for_each(|bool| {
+                        solver.assert(bool);
+                    });
+
+                    let z3sig = &scc_signatures[func_name];
+
+                    solver.assert(z3sig.delta.eq(out_sig.delta));
+                    solver.assert(z3sig.reach.eq(out_sig.reach));
+
+                    solver.minimize(&z3sig.reach);
                 });
 
-                let z3sig = &scc_signatures[func_name];
+            // println!("solving scc = {:?}", scc);
+            let z3::SatResult::Sat = solver.check(&[]) else {
+                println!("z3 COULD NOT SOLVE SCC: {:?}", scc_signatures);
+                continue 'outer;
+            };
 
-                solver.assert(z3sig.delta.eq(out_sig.delta));
-                solver.assert(z3sig.reach.eq(out_sig.reach));
-            });
+            let model = solver.get_model().unwrap();
 
-        // println!("solving scc = {:?}", scc);
-        let z3::SatResult::Sat = solver.check() else {
-            println!("z3 COULD NOT SOLVE SCC: {:?}", scc_signatures);
-            continue 'outer;
-        };
+            // add to known signatures
+            signatures.extend(scc_signatures.iter().map(|(func_name, z3sig)| {
+                let var_name = (*func_name, solve_sig(&model, &solver, z3sig));
+                // println!("Resolved {var_name:?}");
 
-        let model = solver.get_model().unwrap();
-
-        // add to known signatures
-        signatures.extend(scc_signatures.iter().map(|(func_name, z3sig)| {
-            let var_name = (*func_name, solve_sig(&model, &solver, z3sig));
-            // println!("Resolved {var_name:?}");
-
-            var_name
-        }));
+                var_name
+            }));
+        }
     }
 
     println!(
@@ -430,17 +494,10 @@ pub(crate) fn analyze<'names, 'instrs>(
         signatures
     );
 
-    let out = out
-        .into_iter()
-        .map(|(func_name, analyzed_func_graph)| {
-            (
-                func_name,
-                (analyzed_func_graph, signatures.remove(func_name)),
-            )
-        })
-        .collect();
-
-    ResolvedFuncMap(out)
+    AnalysisResult {
+        code: out,
+        resolved_sigs: signatures,
+    }
 }
 
 fn build_function_constraints_from_block_signatures(
@@ -553,7 +610,7 @@ fn build_function_constraints_from_block_signatures(
     Some((res, assertions))
 }
 
-pub(crate) fn create_graph<'inst>(
+pub(crate) fn function_to_basic_blocks<'inst>(
     func: &'inst [types::Instr],
     known: &HashMap<&str, ResolvedSig>,
     scc: &HashMap<&str, Z3Sig>,
@@ -579,7 +636,7 @@ pub(crate) fn create_graph<'inst>(
         basic_blocks.push((last, &func[last..]));
     }
 
-    dbg_println!("basic blocks = {:?}", basic_blocks);
+    dbg_println!("pre processed basic blocks = {:?}", basic_blocks);
 
     let mut out: BTreeMap<_, _> = BTreeMap::new();
 

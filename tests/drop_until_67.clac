@@ -1,0 +1,24 @@
+
+
+: nop ; 
+
+: TEST
+
+
+	67 -
+	if
+	TEST
+	nop nop
+
+	;
+
+
+: TEST2
+
+	if
+	TEST2
+	nop nop
+
+	0
+
+;

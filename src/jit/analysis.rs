@@ -1,7 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+    ops,
+};
 
-use ahash::{HashMap, HashMapExt};
-use cranelift::prelude::Signature;
+use ahash::{HashMap, HashMapExt, HashSet};
+use cranelift::prelude::{Signature, TrapCode};
 
 use crate::types::{self, BasicBlockInstr, CRANELIFT_VALUE, ControlFlowInstr, Instr};
 
@@ -31,8 +35,8 @@ pub(crate) enum Next {
 #[derive(Debug)]
 /// A resolved function signature
 pub struct ResolvedSig {
-    pub(crate) delta: Option<isize>, // None => never type (any delta)
-    pub(crate) reach: usize,
+    pub delta: Option<isize>, // None => never type (any delta)
+    pub reach: usize,
 }
 
 impl ResolvedSig {
@@ -59,30 +63,176 @@ impl ResolvedSig {
 }
 
 #[derive(Debug)]
-// Each variant is the type of terminator
-pub struct Block {
-    // FIXME: this could be Cow
-    pub(crate) code: Vec<BasicBlockInstr>,
+/// A section of Clac code that is guaranteed to not have any control flow. In other words, when you start executing this block from the beginning, it is guaranteed that you will execute all of the instructions in order until the end.
+pub struct BasicBlock<'insts> {
+    pub(crate) code: Vec<Cow<'insts, BasicBlockInstr>>,
     pub(crate) terminator: Terminator,
 }
 
-pub struct AnalysisResult<'names> {
+/// Control flow graph of a clac function.
+/// Note that the usize is just an index used to reference a block. The only invariant is that idx=0 is the starting block of the function (if not an empty function). You cannot rely on index to have any other semantic meaning!
+pub struct Function<'insts>(pub BTreeMap<usize, BasicBlock<'insts>>); // an analyzed function
+
+impl<'a> ops::Deref for Function<'a> {
+    type Target = BTreeMap<usize, BasicBlock<'a>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub struct AnalysisResult<'names, 'insts> {
     /// CFG of functions
-    pub code: HashMap<&'names str, BTreeMap<usize, Block>>,
+    pub code: HashMap<&'names str, Function<'insts>>,
 
     // resolved sig of the functions. The functions here are well behaved. As in, no matter the control flow path it takes to the end, it ultimately has the same stack delta.
-    // TODO: prove theorem where in all well defined functions, all entrypoints to any given block must have the same stack delta
+    // TODO: prove theorem where in all well behaved functions, all entrypoints to any given block must have the same stack delta
     pub resolved_sigs: HashMap<&'names str, ResolvedSig>,
 }
 
-pub(crate) fn analyze<'names>(
-    sccs_graph: &petgraph::Graph<Vec<&'names str>, ()>,
-    funcs: &HashMap<&'names str, &[types::Instr]>,
-) -> AnalysisResult<'names> {
-    // Split functions into blocks
-    let all_blocks: HashMap<&str, BTreeMap<usize, Block>> = funcs
+/// In any given Topo Layer, each SCC should get its own GuessMap. They all share reference to the same already_resolved map (the map produced from combining the resulting GuessMaps from the PREVIOUS TOPO LAYER together)
+pub struct GuessMap<'names, 'lower, T> {
+    guesses: HashMap<&'names str, T>,
+    already_resolved: &'lower HashMap<&'names str, T>, // deltas from a previous SCC (already resolved)
+}
+
+impl<T> GuessMap<'_, '_, T> {
+    pub fn lookup(&self, name: &str) -> Option<&T> {
+        // the intersection between already resolved and guesses should be the null set (TODO: prove this). So, it shouldn't matter which one we look up first. In general though, already resolved will probably return a value more often (since it includes already resolved functions, whereas self.guesses only contains functions in the same SCC as this function, where there are generally quite few)
+        self.already_resolved
+            .get(name)
+            .or_else(|| self.guesses.get(name))
+    }
+}
+
+// All or nothing.
+// TODO: prove that if there is 1 thing in the SCC that is not resolvable, then the entire SCC is not resolvable
+fn solve_scc<'names>(
+    scc_func_names: &'names [&str],
+    all_functions_cfg: &HashMap<&str, Function>,
+    already_resolved_deltas: &HashMap<&str, Delta>,
+) -> Option<(HashMap<&'names str, Delta>, HashMap<&'names str, Reach>)> {
+    // --- Find deltas ---
+    let mut guess_map = GuessMap {
+        guesses: scc_func_names
+            .iter()
+            .map(|&name| (name, Delta::Never))
+            .collect(), // Initially guess that all of the functions in this SCC are Never
+
+        already_resolved: already_resolved_deltas,
+    };
+
+    // Repeatedly re-guess
+    // TODO: prove termination
+    loop {
+        let new_delta_guesses: HashMap<&str, Delta> = scc_func_names
+            .iter()
+            .map(|&name| {
+                let code = all_functions_cfg
+                    .get(name)
+                    .expect("Function in SCC should have its blocks known");
+
+                find_func_delta(code, &guess_map).map(|delta| (name, delta))
+            })
+            .collect::<Option<_>>()?; // if one of the functions in the SCC is not resolvable, then the entire SCC is unresolvable
+
+        if new_delta_guesses == guess_map.guesses {
+            break;
+        }
+
+        guess_map.guesses = new_delta_guesses;
+    }
+
+    // --- Do infinite-reach detection on the remaining reaches ---
+    // FIXME!!!: MAKE IT SO THAT WE CAN USE ACTUAL ISIZE EDGES INSTEAD OF F64 EDGES
+    // (petgraph's find_negative_cycle requires f64 edges)
+    let mut graph: petgraph::Graph<&str, f64> = petgraph::Graph::new();
+    let nodes: HashMap<&str, _> = scc_func_names
         .iter()
-        .map(|(&func_name, func_instrs)| (func_name, raw_func_instrs_to_blocks(func_instrs)))
+        .map(|&name| (name, graph.add_node(name)))
+        .collect();
+
+    for caller_name in scc_func_names.iter() {
+        for (callee_name, call_delta) in find_func_calls_with_deltas(
+            all_functions_cfg
+                .get(caller_name)
+                .expect("Name should refer to function in funcs"),
+            &all_deltas,
+            &funcs_with_well_behaved_deltas,
+        ) {
+            graph.add_edge(
+                *nodes.get(caller_name).expect(
+                    "Caller should have been included as a function with well-behaved delta",
+                ),
+                *nodes.get(callee_name).expect(
+                    "Callee should have been included as a function with well-behaved delta",
+                ),
+                call_delta as f64,
+            );
+        }
+    }
+
+    let funcs_with_well_behaved_deltas_and_bounded_reaches: Vec<&str> = nodes
+        .iter()
+        .filter_map(|(&name, &index)| {
+            if petgraph::algo::find_negative_cycle(&graph, index).is_some() {
+                // If negative cycle, then its reach is unbounded,
+                // and we don't include it in the filtered list
+                all_reaches.insert(name, Reach::Unbounded);
+                None
+            } else {
+                // If no negative cycle, we continue to analyze it
+                // in the next step
+                Some(name)
+            }
+        })
+        .collect();
+
+    // --- Repeatedly guess reaches for those that are neither not-well-behaved-delta nor infinite-reach ---
+    let mut reach_guesses: Vec<(&str, Reach)> = funcs_with_well_behaved_deltas_and_bounded_reaches
+        .iter()
+        .map(|&name| (name, Reach::Num(0)))
+        .collect();
+
+    loop {
+        reach_guesses.iter().for_each(|(name, r)| {
+            all_reaches.insert(name, r.clone());
+        });
+        let new_reach_guesses: Vec<(&str, Reach)> =
+            funcs_with_well_behaved_deltas_and_bounded_reaches
+                .iter()
+                .map(|&name| {
+                    let code = all_functions_cfg
+                        .get(name)
+                        .expect("Function in SCC should have its blocks known");
+                    (name, find_func_reach(code, &all_deltas, &all_reaches))
+                })
+                .collect();
+        if new_reach_guesses == reach_guesses {
+            break;
+        }
+        reach_guesses = new_reach_guesses;
+    }
+}
+
+/// Given a Clac Program, recover control flow of all functions, and attempt to recover function signatures (for as many functions as possible).
+pub(crate) fn analyze<'names, 'instrs>(
+    sccs_graph: &petgraph::Graph<Vec<&'names str>, ()>,
+    funcs: &HashMap<&'names str, &'instrs [types::Instr]>,
+) -> AnalysisResult<'names, 'instrs> {
+    // get a set of all function names
+    let defined_funcs: HashSet<_> = funcs.keys().map(|x| *x).collect();
+
+    // Perform control flow graph analysis on all functions. Also, resolve drops and picks.
+    // NOTE: All of functions in here DO NOT call undefined functions.
+    let all_funcs_cfg: HashMap<&str, Function> = funcs
+        .iter()
+        .map(|(&func_name, func_instrs)| {
+            (
+                func_name,
+                raw_instrs_to_analyzed_function(&defined_funcs, func_instrs),
+            )
+        })
         .collect();
 
     // Toposort SCCs
@@ -92,125 +242,11 @@ pub(crate) fn analyze<'names>(
 
     // --- FIND DELTAS AND REACHES ---
 
-    let mut all_deltas = HashMap::<&str, Delta>::new();
-    let mut all_reaches = HashMap::<&str, Reach>::new();
+    let mut all_deltas: HashMap<&str, Delta> = HashMap::new();
+    let mut all_reaches: HashMap<&str, Reach> = HashMap::new();
 
     for scc in sccs_in_order {
-        let scc_func_names = sccs_graph[scc].as_slice();
-
-        // --- Find deltas ---
-
-        // Initially guess that all of the functions are Never
-        let mut delta_guesses: Vec<(&str, Delta)> = scc_func_names
-            .iter()
-            .map(|&name| (name, Delta::Never))
-            .collect();
-        // Repeatedly re-guess
-        loop {
-            delta_guesses.iter().for_each(|(name, d)| {
-                all_deltas.insert(name, d.clone());
-            });
-            let new_delta_guesses: Vec<(&str, Delta)> = scc_func_names
-                .iter()
-                .map(|&name| {
-                    let code = all_blocks
-                        .get(name)
-                        .expect("Function in SCC should have its blocks known");
-                    (name, find_func_delta(code, &all_deltas))
-                })
-                .collect();
-            if new_delta_guesses == delta_guesses {
-                break;
-            }
-            delta_guesses = new_delta_guesses;
-        }
-
-        // --- Throw out functions that are known to be not well-behaved (give them dummy/default reach, it shouldn't matter what) ---
-        let funcs_with_well_behaved_deltas: Vec<&str> = scc_func_names
-            .iter()
-            .map(|&name| name)
-            .filter(|name| {
-                match all_deltas
-                    .get(name)
-                    .expect("Function in SCC should have had its delta analyzed")
-                {
-                    Delta::NotWellBehaved => {
-                        all_reaches.insert(name, Reach::default()); // Dummy value (must be inserted)
-                        false
-                    }
-                    _ => true,
-                }
-            })
-            .collect();
-
-        // --- Do infinite-reach detection on the remaining reaches ---
-        // FIXME!!!: MAKE IT SO THAT WE CAN USE ACTUAL ISIZE EDGES INSTEAD OF F64 EDGES
-        // (petgraph's find_negative_cycle requires f64 edges)
-        let mut graph: petgraph::Graph<&str, f64> = petgraph::Graph::new();
-        let nodes: HashMap<&str, _> = funcs_with_well_behaved_deltas
-            .iter()
-            .map(|&name| (name, graph.add_node(name)))
-            .collect();
-        for caller_name in funcs_with_well_behaved_deltas.iter() {
-            for (callee_name, call_delta) in find_func_calls_with_deltas(
-                all_blocks
-                    .get(caller_name)
-                    .expect("Name should refer to function in funcs"),
-                &all_deltas,
-                &funcs_with_well_behaved_deltas,
-            ) {
-                graph.add_edge(
-                    *nodes.get(caller_name).expect(
-                        "Caller should have been included as a function with well-behaved delta",
-                    ),
-                    *nodes.get(callee_name).expect(
-                        "Callee should have been included as a function with well-behaved delta",
-                    ),
-                    call_delta as f64,
-                );
-            }
-        }
-        let funcs_with_well_behaved_deltas_and_bounded_reaches: Vec<&str> = nodes
-            .iter()
-            .filter_map(|(&name, &index)| {
-                if petgraph::algo::find_negative_cycle(&graph, index).is_some() {
-                    // If negative cycle, then its reach is unbounded,
-                    // and we don't include it in the filtered list
-                    all_reaches.insert(name, Reach::Unbounded);
-                    None
-                } else {
-                    // If no negative cycle, we continue to analyze it
-                    // in the next step
-                    Some(name)
-                }
-            })
-            .collect();
-
-        // --- Repeatedly guess reaches for those that are neither not-well-behaved-delta nor infinite-reach ---
-        let mut reach_guesses: Vec<(&str, Reach)> =
-            funcs_with_well_behaved_deltas_and_bounded_reaches
-                .iter()
-                .map(|&name| (name, Reach::Num(0)))
-                .collect();
-        loop {
-            reach_guesses.iter().for_each(|(name, r)| {
-                all_reaches.insert(name, r.clone());
-            });
-            let new_reach_guesses: Vec<(&str, Reach)> =
-                funcs_with_well_behaved_deltas_and_bounded_reaches
-                    .iter()
-                    .map(|&name| {
-                        let code = all_blocks
-                            .get(name)
-                            .expect("Function in SCC should have its blocks known");
-                        (name, find_func_reach(code, &all_deltas, &all_reaches))
-                    })
-                    .collect();
-            if new_reach_guesses == reach_guesses {
-                break;
-            }
-            reach_guesses = new_reach_guesses;
-        }
+        solve_scc(&sccs_graph[scc]);
     }
 
     // Combine Deltas and Reaches into ResolvedSigs
@@ -234,24 +270,46 @@ pub(crate) fn analyze<'names>(
 
     // Return result
     AnalysisResult {
-        code: all_blocks,
+        code: all_funcs_cfg,
         resolved_sigs: all_sigs,
     }
 }
 
-fn raw_func_instrs_to_blocks(func_code: &[Instr]) -> BTreeMap<usize, Block> {
+/// Try to unwrap a Cow Instr
+fn into_basic_block_instr(x: Cow<Instr>) -> Option<Cow<BasicBlockInstr>> {
+    match x {
+        Cow::Borrowed(x) => {
+            if let Instr::BBInstr(x) = x {
+                Some(Cow::Borrowed(x))
+            } else {
+                None
+            }
+        }
+        Cow::Owned(x) => Some(Cow::Owned(x.try_into().ok()?)),
+    }
+}
+
+/// The returned function is guaranteed to not have calls to undefined functions.
+// TODO: encode that invariant into type system
+fn raw_instrs_to_analyzed_function<'insts>(
+    all_defined_funcs: &HashSet<&str>,
+    func_code: &'insts [Instr],
+) -> Function<'insts> {
     // Get breaks
     let mut breaks: BTreeSet<usize> = get_block_breaks_v2(func_code);
     dbg_println!("breaks = {:?}", breaks);
 
     // Divide according to breaks
     breaks.insert(func_code.len()); // Put break at end of function
+
     let mut blocks: Vec<(usize, &[Instr])> = Vec::new();
+
     let mut prev_br: usize = 0;
     for mut curr_br in breaks {
         if prev_br == func_code.len() {
             break;
         }
+
         curr_br = std::cmp::min(curr_br, func_code.len());
         blocks.push((prev_br, &func_code[prev_br..curr_br]));
         prev_br = curr_br;
@@ -259,7 +317,7 @@ fn raw_func_instrs_to_blocks(func_code: &[Instr]) -> BTreeMap<usize, Block> {
 
     dbg_println!("basic blocks before processing = {:?}", unprocessed);
 
-    // Get terminators (must be done BEFORE resolving drops and picks)
+    // Get terminators (must be done BEFORE resolving drops and picks) (this is because resolving drops and picks can break the idx references (since they can change the size of the code))
     let blocks: Vec<(usize, (&[Instr], Terminator))> = blocks
         .into_iter()
         .map(|(block_start, block_code)| {
@@ -270,28 +328,41 @@ fn raw_func_instrs_to_blocks(func_code: &[Instr]) -> BTreeMap<usize, Block> {
         })
         .collect();
 
-    // Resolve drops and picks
-    let blocks: Vec<(usize, (Vec<Instr>, Terminator))> = blocks
+    // Resolve drops and picks, also turn calls to nonexistent functions into traps
+    let blocks: Vec<(usize, (Vec<Cow<Instr>>, Terminator))> = blocks
         .into_iter()
         .map(|(block_start, (block_code, terminator))| {
             (
                 block_start,
-                (resolve_drops_and_picks(block_code), terminator),
+                (
+                    resolve_drops_and_picks(block_code)
+                        .into_iter()
+                        .map(|x| match &*x {
+                            Instr::BBInstr(BasicBlockInstr::FunctionCall(callee))
+                                if !all_defined_funcs.contains(callee.as_str()) =>
+                            {
+                                Cow::Owned(BasicBlockInstr::Trap(TrapCode::unwrap_user(20)).into())
+                            }
+                            _ => x,
+                        })
+                        .collect(),
+                    terminator,
+                ),
             )
         })
         .collect();
 
     // Finalize blocks by coercing instructions to basic block instructions and collecting blocks in a BTreeMap
-    let blocks: BTreeMap<usize, Block> = blocks
+    let blocks: BTreeMap<usize, BasicBlock> = blocks
         .into_iter()
         .map(|(block_start, (instrs, terminator))| {
             (
                 block_start,
-                Block {
+                BasicBlock {
                     code: instrs
                         .into_iter()
-                        .map(|raw_instr| {
-                            raw_instr.try_into().expect(
+                        .map(|x| {
+                            into_basic_block_instr(x).expect(
                                 "Block should only contain basic block instructions at this point",
                             )
                         })
@@ -302,7 +373,7 @@ fn raw_func_instrs_to_blocks(func_code: &[Instr]) -> BTreeMap<usize, Block> {
         })
         .collect();
 
-    blocks
+    Function(blocks)
 }
 
 // TODO: This function could theoretically suffer from addition overflow/wraparound in extreme cases?
@@ -346,11 +417,13 @@ fn extract_terminator(
     func_length: usize,
 ) -> (&[Instr], Terminator) {
     use {BasicBlockInstr::*, ControlFlowInstr::*, Instr::*, std::cmp::Ordering::*};
+
     let get_next = |position: usize| match position.cmp(&func_length) {
         Less => Next::Block(position),
         Equal => Next::Terminate,
         Greater => Next::Trap,
     };
+
     match block_code {
         [body @ .., CFInstr(If)] => (
             body,
@@ -379,11 +452,14 @@ fn extract_terminator(
 }
 
 // TODO: Should invalid arguments cause a panic? Should 0 0 drop_range be disallowed?
-fn resolve_drops_and_picks(mut block_code: &[Instr]) -> Vec<Instr> {
+fn resolve_drops_and_picks(mut block_code: &[Instr]) -> Vec<Cow<Instr>> {
     use {BasicBlockInstr::*, Instr::*};
-    let mut result = Vec::<Instr>::new();
+
+    let mut result: Vec<Cow<Instr>> = Vec::new();
+
     loop {
-        let (instr_to_push, rest) = match block_code {
+        let instr_to_push: Cow<Instr>;
+        (instr_to_push, block_code) = match block_code {
             [
                 BBInstr(Literal(start)),
                 BBInstr(Literal(amt)),
@@ -393,64 +469,71 @@ fn resolve_drops_and_picks(mut block_code: &[Instr]) -> Vec<Instr> {
                 && let Ok(amt) = (*amt).try_into()
                 && start >= amt =>
             {
-                (BBInstr(ResolvedDropRange { start, amt }), rest)
+                (Cow::Owned(BBInstr(ResolvedDropRange { start, amt })), rest)
             }
             [BBInstr(Literal(n)), BBInstr(BadPick), rest @ ..]
                 if let Ok(n) = (*n).try_into()
                     && n >= 1 =>
             {
-                (BBInstr(ResolvedPick(n)), rest)
+                (Cow::Owned(BBInstr(ResolvedPick(n))), rest)
             }
-            // FIXME: This should be Cow
-            [instruction, rest @ ..] => (instruction.clone(), rest),
+            [instruction, rest @ ..] => (Cow::Borrowed(instruction), rest),
             [] => break,
         };
+
         result.push(instr_to_push);
-        block_code = rest;
     }
+
     result
 }
 
 #[derive(PartialEq, Clone, Debug)]
-pub(crate) enum Delta {
+pub enum Delta {
     Num(isize),
     Never,
-    NotWellBehaved,
 }
 
-fn combine_sequential_deltas(d1: Delta, d2: Delta) -> Delta {
-    use Delta::*;
-    match (d1, d2) {
-        (Never, _) => Never, // What comes after doesn't matter due to trap
-        (NotWellBehaved, _) => NotWellBehaved, // Carrying over stack could fail, even if the next operation is Never
-        (Num(_), Never) => Never,
-        (Num(_), NotWellBehaved) => NotWellBehaved,
-        (Num(d1), Num(d2)) => Num(d1 + d2),
+impl ops::Add for Delta {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        match (self, rhs) {
+            (Delta::Num(a), Delta::Num(b)) => Delta::Num(a + b),
+            (Delta::Never, _) | (_, Delta::Never) => Delta::Never,
+        }
     }
 }
 
-fn combine_branching_deltas(d1: Delta, d2: Delta) -> Delta {
+fn combine_branching_deltas(lhs: Delta, rhs: Delta) -> Option<Delta> {
     use Delta::*;
-    match (d1, d2) {
-        (Never, d) | (d, Never) => d,
-        (Num(d1), Num(d2)) if d1 == d2 => Num(d1),
-        _ => NotWellBehaved,
+
+    match (lhs, rhs) {
+        (Never, d) | (d, Never) => Some(d),
+        (Num(d1), Num(d2)) if d1 == d2 => Some(Num(d1)),
+        (Num(_), Num(_)) => None,
     }
 }
 
-fn find_func_delta(blocks: &BTreeMap<usize, Block>, known: &HashMap<&str, Delta>) -> Delta {
+impl Terminator {
+    // delta caused by popping the conditional value
+    fn get_additional_delta(&self) -> Delta {
+        match self {
+            Terminator::Jump(_) => Delta::Num(0),
+            Terminator::If { .. } => Delta::Num(-1),
+            Terminator::Skip { .. } => Delta::Num(-1),
+        }
+    }
+}
+
+fn find_func_delta(
+    blocks: &BTreeMap<usize, BasicBlock>,
+    guess_map: &GuessMap<Delta>,
+) -> Option<Delta> {
     // A given block's associated path delta is the delta of starting with that block and going to the end of the function
-    let mut path_deltas = BTreeMap::<usize, Delta>::new();
+    let mut path_deltas: BTreeMap<usize, Delta> = BTreeMap::new();
 
     // for loop must be backward (takes advantage of Clac control flow)
     for (&curr_pos, curr_block) in blocks.iter().rev() {
-        // Add together body of current block
-        let block_body_delta = curr_block
-            .code
-            .iter()
-            .map(|basic_block_instr| basic_block_instr.delta(&known))
-            .fold(Delta::Num(0), combine_sequential_deltas);
-
         // Lambda to convert Next component of Terminator to Delta
         let delta_from_next = |next: &Next| -> Delta {
             match next {
@@ -463,29 +546,44 @@ fn find_func_delta(blocks: &BTreeMap<usize, Block>, known: &HashMap<&str, Delta>
             }
         };
 
-        // Add on terminator
-        let curr_path_delta = combine_sequential_deltas(
-            block_body_delta,
-            match &curr_block.terminator {
-                Terminator::Jump(next) => delta_from_next(next),
-                Terminator::If { on_true, on_false } => combine_sequential_deltas(
-                    Delta::Num(-1),
-                    combine_branching_deltas(delta_from_next(on_true), delta_from_next(on_false)),
-                ),
-                Terminator::Skip { targets } => combine_sequential_deltas(
-                    Delta::Num(-1),
-                    targets
+        let process_block = |curr_block: &BasicBlock| -> Option<_> {
+            // Add together body of current block
+            let mut block_body_delta = Delta::Num(0);
+            for instr in &curr_block.code {
+                let delta = instr.delta(&guess_map)?;
+
+                if let Delta::Never = delta {
+                    // if this block calls a never, then this block delta should be never
+                    return Some(Delta::Never);
+                }
+
+                block_body_delta = block_body_delta + delta;
+            }
+
+            Some(
+                block_body_delta
+
+                + curr_block.terminator.get_additional_delta() // delta due to terminator
+
+                + match &curr_block.terminator {
+                    Terminator::Jump(next) => delta_from_next(next),
+                    Terminator::If { on_true, on_false } => combine_branching_deltas(
+                        delta_from_next(on_true),
+                        delta_from_next(on_false),
+                    )?,
+                    Terminator::Skip { targets } => targets
                         .iter()
                         .map(delta_from_next)
-                        .fold(delta_from_next(&Next::Trap), combine_branching_deltas),
-                ),
-            },
-        );
+                        .try_fold(Delta::Never, combine_branching_deltas)?,
+                },
+            )
+        };
 
-        path_deltas.insert(curr_pos, curr_path_delta);
+        path_deltas.insert(curr_pos, process_block(curr_block)?);
     }
+
     // Default delta for empty function is 0
-    path_deltas.get(&0).map_or(Delta::Num(0), Clone::clone)
+    Some(path_deltas.remove(&0).unwrap_or(Delta::Num(0)))
 }
 
 #[derive(PartialEq, Clone, Debug, Default)]
@@ -523,9 +621,19 @@ fn combine_branching_reaches(r1: Reach, r2: Reach) -> Reach {
     }
 }
 
-// SHOULD ONLY BE CALLED ON FUNCTIONS WITH WELL-BEHAVED DELTAS
+// impl Function {
+//     fn all_blocks_start_at_same_accumulated_delta_over_all_control_paths(&self) -> bool {
+//         let start_counts: HashMap<usize, usize> = HashMap::new();
+
+//         for (start, block) in self.iter() {}
+
+//         todo!()
+//     }
+// }
+
+/// SHOULD ONLY BE CALLED ON FUNCTIONS WITH WELL-BEHAVED DELTAS
 fn find_func_reach(
-    blocks: &BTreeMap<usize, Block>,
+    blocks: &BTreeMap<usize, BasicBlock>,
     known_deltas: &HashMap<&str, Delta>,
     known_reaches: &HashMap<&str, Reach>,
 ) -> Reach {
@@ -591,7 +699,6 @@ fn basic_block_instr_to_calls_with_deltas<'a>(
 }
 
 // TODO: Eliminate unncessary duplicate edges
-
 fn combine_sequential_calls_with_deltas<'a>(
     (c1, d1): (Vec<(&'a str, isize)>, Delta),
     c2: Vec<(&'a str, isize)>,
@@ -622,8 +729,8 @@ fn combine_branching_calls_with_deltas<'a>(
 
 // TODO: Make the efficiency of this function (and others) better
 fn find_func_calls_with_deltas<'a>(
-    blocks: &'a BTreeMap<usize, Block>,
-    known_deltas: &HashMap<&str, Delta>,
+    blocks: &'a BTreeMap<usize, BasicBlock>,
+    known_deltas: &GuessMap<Delta>,
     funcs_analyzed: &[&str],
 ) -> Vec<(&'a str, isize)> {
     let mut path_calls_with_deltas = BTreeMap::<usize, Vec<(&'a str, isize)>>::new();
@@ -676,17 +783,20 @@ fn find_func_calls_with_deltas<'a>(
     path_calls_with_deltas.get(&0).map_or(vec![], Clone::clone)
 }
 
-fn delta_and_reach_to_resolved_sig(d: &Delta, r: &Reach) -> Option<ResolvedSig> {
-    match (d, r) {
-        (Delta::Num(d), Reach::Num(r)) => Some(ResolvedSig {
-            delta: Some(*d),
-            reach: *r,
-        }),
-        (Delta::Never, Reach::Num(r)) => Some(ResolvedSig {
-            delta: None,
-            reach: *r,
-        }),
-        (Delta::NotWellBehaved, _) => None,
-        (_, Reach::Unbounded) => None,
+impl TryFrom<(&Delta, &Reach)> for ResolvedSig {
+    type Error = ();
+
+    fn try_from((d, r): (&Delta, &Reach)) -> Result<Self, Self::Error> {
+        match (d, r) {
+            (Delta::Num(d), Reach::Num(r)) => Ok(Self {
+                delta: Some(*d),
+                reach: *r,
+            }),
+            (Delta::Never, Reach::Num(r)) => Ok(Self {
+                delta: None,
+                reach: *r,
+            }),
+            (_, Reach::Unbounded) => Err(()),
+        }
     }
 }

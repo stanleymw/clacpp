@@ -1,8 +1,10 @@
 use core::{fmt, slice};
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::io;
 
 use ahash::{HashMap, HashMapExt};
+use cranelift::prelude::TrapCode;
 use cranelift::prelude::{AbiParam, Signature, types::I64};
 use cranelift_jit::{ArenaMemoryProvider, JITBuilder, JITModule};
 use cranelift_module::{FuncId, Module};
@@ -10,7 +12,7 @@ use thiserror::Error;
 
 use crate::builtins;
 
-use crate::jit::analysis::{Delta, Reach, ResolvedSig};
+use crate::jit::analysis::{Delta, GuessMap, Reach, ResolvedSig};
 use crate::jit::jit_builtins;
 
 pub type Value = i64;
@@ -60,40 +62,57 @@ pub(crate) enum BasicBlockInstr {
     ResolvedPick(usize), // <amt> pick => delta = 1, reach = amt
     BadPick,             // delta = 0, reach = indeterminate
 
+    Trap(TrapCode), // special trap instruction
+
     // Math/Memory Instructions
     Arith(ArithOp), // delta = -1, reach = 2
     Mem(MemOp),     // see `MemOp`
 }
 
 impl BasicBlockInstr {
-    pub(crate) fn delta(&self, known_deltas: &HashMap<&str, Delta>) -> Delta {
+    /// All *resolved* callees MUST be in known_deltas. Can return None in 2 cases: BadDropRange, or calls a function that has not been resolved
+    pub(crate) fn delta(&self, known_deltas: &GuessMap<Delta>) -> Option<Delta> {
         use {BasicBlockInstr::*, Delta::*};
+
         match self {
-            Literal(_) => Num(1),
-            FunctionCall(name) => known_deltas.get(name.as_str()).map_or(Never, Clone::clone),
-            Quit => Never,
-            Print => Num(-1),
-            Syscall => Num(-6),
-            Drop => Num(-1),
-            Swap => Num(0),
-            Rot => Num(0),
-            ResolvedDropRange { start: _, amt } => Num(-(*amt as isize)),
-            BadDropRange => NotWellBehaved,
-            ResolvedPick(_) => Num(1),
-            BadPick => Num(0),
-            Arith(_) => Num(-1),
-            Mem(mem_op) => mem_op.delta(),
+            // these are the only 2 cases that can result in an unresolved delta
+            BadDropRange => None,
+            FunctionCall(name) => known_deltas.lookup(name).map(Clone::clone), // should fail only when we call unresolved functions
+
+            x => Some(match x {
+                Literal(_) => Num(1),
+
+                Quit => Never,
+                Trap(_) => Never,
+
+                Print => Num(-1),
+                Syscall => Num(-6),
+                Drop => Num(-1),
+                Swap => Num(0),
+                Rot => Num(0),
+                ResolvedDropRange { start: _, amt } => Num(-(*amt as isize)),
+                ResolvedPick(_) => Num(1),
+                BadPick => Num(0),
+                Arith(_) => Num(-1),
+                Mem(mem_op) => mem_op.delta(),
+
+                BadDropRange => unreachable!(),
+                FunctionCall(_) => unreachable!(),
+            }),
         }
     }
 
-    pub(crate) fn reach(&self, known_reaches: &HashMap<&str, Reach>) -> Reach {
+    /// Returns None if this is a function call to a function that does not have a known reach
+    pub(crate) fn reach(&self, known_reaches: &HashMap<&str, Reach>) -> Option<Reach> {
         use {BasicBlockInstr::*, Reach::*};
-        match self {
+
+        Some(match self {
             Literal(_) => Num(0),
-            FunctionCall(name) => known_reaches
-                .get(name.as_str())
-                .map_or(Num(0), Clone::clone),
+            FunctionCall(name) => known_reaches.get(name.as_str())?.clone(),
+            // .map_or(Num(0), Clone::clone),
             Quit => Num(0),
+            Trap(_) => Num(0),
+
             Print => Num(1),
             Syscall => Num(7),
             Drop => Num(1),
@@ -105,7 +124,7 @@ impl BasicBlockInstr {
             BadPick => Unbounded,
             Arith(_) => Num(2),
             Mem(mem_op) => mem_op.reach(),
-        }
+        })
     }
 }
 

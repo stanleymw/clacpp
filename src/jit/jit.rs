@@ -193,7 +193,12 @@ fn compile_block(
     let line = &code.code;
 
     for (i, inst) in line.iter().enumerate() {
+        let inst = inst.as_ref();
         match inst {
+            BasicBlockInstr::Trap(trapcode) => {
+                bu.ins().trap(*trapcode);
+                return;
+            }
             BasicBlockInstr::Literal(n) => {
                 let out = bu.ins().iconst(I64, *n);
                 tmp.push(out);
@@ -621,8 +626,8 @@ fn get_callees(line: &[types::Instr]) -> HashSet<&str> {
         .collect()
 }
 
-struct UnifiedBlock {
-    code: analysis::Block,
+struct UnifiedBlock<'insts> {
+    code: analysis::Block<'insts>,
     cranelift: cranelift::prelude::Block,
 }
 
